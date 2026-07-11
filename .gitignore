@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+archive/
+/venv
+/__pycache__
+/archive
