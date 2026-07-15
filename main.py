@@ -27,7 +27,7 @@ PPE_CLASSES = {
 }
 
 # Video path
-video_path = "https://www.shutterstock.com/shutterstock/videos/1095100351/preview/stock-footage-wide-shot-of-two-male-construction-supervisors-wearing-face-masks-green-reflective-vest-and-white.webm"
+video_path = "https://www.shutterstock.com/shutterstock/videos/4092636713/preview/stock-footage-engineer-men-and-handshake-for-construction-team-with-collaboration-renovation-or-talking.webm"
 cap = cv2.VideoCapture(video_path)
 
 while cap.isOpened():
@@ -54,6 +54,10 @@ while cap.isOpened():
             class_id = int(box.cls[0])
             confidence = float(box.conf[0])
             label = PPE_CLASSES[class_id]
+            
+            # Skip Machinery, Vehicle, Mask, and NO-Mask classes
+            if label in ["Machinery", "Vehicle", "Mask", "NO-Mask"]:
+                continue
             
             # Get box coordinates
             x1, y1, x2, y2 = map(int, box.xyxy[0])
