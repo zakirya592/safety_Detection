@@ -51,7 +51,7 @@ PPE_SHOW_LABELS = {"Hardhat", "NO-Hardhat", "Safety Vest", "NO-Safety Vest", "Pe
 PPE_VIOLATION_LABELS = {"NO-Hardhat", "NO-Safety Vest"}
 
 # Video path
-video_path = "https://www.shutterstock.com/shutterstock/videos/3748409091/preview/stock-footage-an-adult-woman-is-doing-active-sports-on-the-grass-in-a-city-park.webm"
+video_path = "https://www.shutterstock.com/shutterstock/videos/1099083587/preview/stock-footage-teamwork-of-black-workers-working-in-large-warehouse-store-industry-rack-of-stock-storage-interior.webm"
 cap = cv2.VideoCapture(video_path)
 
 while cap.isOpened():
