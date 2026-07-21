@@ -4,6 +4,7 @@ import time
 
 import cv2
 from flask import Flask, Response
+from flask_cors import CORS
 
 # Import detection logic and models from camera_shoes
 from camera_shoes import CAMERA_CONFIGS, PersonTracker, process_frame
@@ -12,6 +13,7 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 PORT = 5051
 
 _frame_lock = threading.Lock()
