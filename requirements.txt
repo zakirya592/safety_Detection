@@ -1,5 +1,5 @@
 pip==26.1.2
-pygame==2.6.1
+pygame
 opencv-python
 ultralytics
 flask
