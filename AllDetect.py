@@ -53,10 +53,10 @@ PERSON_CONFIDENCE_THRESHOLD = 0.30
 # gloves are actually being detected by the model at all, and that the
 # class_id -> label mapping in BOOTS_CLASSES matches what the model was
 # trained with. Turn back off once goggles/gloves are confirmed working.
-DEBUG_RAW_DETECTIONS = True
+DEBUG_RAW_DETECTIONS = False
 
 # Performance optimization settings
-PROCESS_EVERY_N_FRAMES = 5  # Process every Nth frame to improve performance
+PROCESS_EVERY_N_FRAMES = 10  # Process every Nth frame to improve performance
 MODEL_INPUT_SIZE = 640       # Smaller input size for faster inference
 
 # Person tracking settings
@@ -257,7 +257,7 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     violating_persons = []
     detected_persons = []
 
-    annotated = frame.copy()
+    annotated = frame
 
     if frame_count % PROCESS_EVERY_N_FRAMES != 0:
         active_tracks = person_tracker.update([])
@@ -277,7 +277,11 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         
     small_frame = cv2.resize(frame, (640, 360))
     # ---- Run boots model with smaller input size ----
-    boots_results = boots_model(small_frame, imgsz=MODEL_INPUT_SIZE, conf=0.15, verbose=False)
+    boots_results = boots_model( source=small_frame,
+    imgsz=640,
+    conf=0.25,
+    stream=True,
+    verbose=False)
 
     boots_detections = []
 
@@ -471,11 +475,11 @@ def main():
     while True:
         frames = []
         for cap, name in caps:
-            # success, frame = cap.read()
+            success, frame = cap.read()
             # while cap.grab():
             #     pass
             cap.grab()
-            success, frame = cap.retrieve()
+            # success, frame = cap.retrieve()
             if success:
                 frame_counters[name] += 1
                 processed_frame = process_frame(frame, name, frame_counters[name], person_trackers[name])
