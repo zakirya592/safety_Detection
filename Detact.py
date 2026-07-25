@@ -28,10 +28,10 @@ PPE_CLASSES = {
 }
 
 # Only these two classes get drawn at all
-SHOW_LABELS = {"boots", "no_boots"}
+SHOW_LABELS = {"boots", "no_boots", "goggles", "no_goggle", "gloves", "no_gloves", "Person"}
 
 # Only this label triggers the alarm
-VIOLATION_LABELS = {"no_boots"}
+VIOLATION_LABELS = {"no_boots", "no_goggle", "no_gloves"}
 
 # Video path
 video_path = "https://www.shutterstock.com/shutterstock/videos/4062325895/preview/stock-footage-car-salesman-showing-new-suv-to-indian-customer-in-dealership-showroom.webm"
