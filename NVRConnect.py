@@ -5,11 +5,16 @@ from alarm import Alarm
 from screenshot import ScreenshotManager
 from detection_alert_db import save_detection_alerts_async
 import os
+import threading
 
 # Initialize alarm
 alarm = Alarm()
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+
+RTSP_OPEN_TIMEOUT_MS = 5000
+_working_rtsp_urls = {}
+_open_camera_lock = threading.Lock()
 
 # Initialize screenshot manager with 30-second reset time
 screenshot_manager = ScreenshotManager(reset_time_seconds=30)
@@ -195,7 +200,7 @@ class PersonTracker:
 
 RAW_USERNAME = "admin"
 RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.100.9"
+NVR_IP = "192.168.100.218"
 RTSP_PORT = 554
 
 USER_ENC = quote(RAW_USERNAME, safe="")
@@ -212,6 +217,11 @@ def build_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
     hik_channel = f"{channel}01"  # e.g. channel 1 -> 101, channel 2 -> 201
 
     return [
+        # Uniview-style (IPC2122LB cameras / Uniview NVR — try first)
+        f"rtsp://{auth}/unicast/c{channel}/s0/live",
+        f"rtsp://{auth}/unicast/c{channel}/s1/live",
+        f"rtsp://{auth}/media/video{channel}",
+
         # Hikvision-style
         f"rtsp://{auth}/Streaming/Channels/{hik_channel}",
         f"rtsp://{auth}/Streaming/Channels/{hik_channel}/main",
@@ -220,11 +230,6 @@ def build_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
         # Dahua-style
         f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=0",
         f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=1",
-
-        # Uniview-style (matches the IPC2122LB cameras / Uniview NVR)
-        f"rtsp://{auth}/unicast/c{channel}/s0/live",
-        f"rtsp://{auth}/unicast/c{channel}/s1/live",
-        f"rtsp://{auth}/media/video{channel}",
 
         # Generic fallbacks
         f"rtsp://{auth}/channel{channel}",
@@ -502,28 +507,39 @@ def open_camera(config):
     Try each candidate RTSP URL in order until one both opens AND
     successfully returns a frame. Returns (cap, name) or (None, None).
     """
-    print(f"Connecting to {config['name']} at {config['ip']}...")
+    camera_name = config["name"]
+    print(f"Connecting to {camera_name} at {config['ip']}...")
 
-    for rtsp_url in config['rtsp_urls']:
-        # Mask password in the printed log line
-        safe_log_url = rtsp_url.replace(PASS_ENC, "****")
-        print(f"  Trying: {safe_log_url}")
+    rtsp_urls = list(config["rtsp_urls"])
+    cached_url = _working_rtsp_urls.get(camera_name)
+    if cached_url:
+        rtsp_urls = [cached_url] + [url for url in rtsp_urls if url != cached_url]
 
-        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    with _open_camera_lock:
+        for rtsp_url in rtsp_urls:
+            safe_log_url = rtsp_url.replace(PASS_ENC, "****")
+            print(f"  Trying: {safe_log_url}")
 
-        if not cap.isOpened():
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
+            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
+
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                _working_rtsp_urls[camera_name] = rtsp_url
+                print(f"  Connected using: {safe_log_url}")
+                return cap, camera_name
+
             cap.release()
-            continue
 
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            print(f"  Connected using: {safe_log_url}")
-            return cap, config['name']
-
-        cap.release()
-
-    print(f"Failed to connect to {config['name']} after trying all URL formats")
+    print(f"Failed to connect to {camera_name} after trying all URL formats")
     return None, None
 
 
@@ -548,15 +564,21 @@ def main():
     person_trackers = {name: PersonTracker() for _, name in caps}
 
     while True:
-        frames = []
+        snapshots = []
         for cap, name in caps:
             success, frame = cap.read()
             if success:
-                frame_counters[name] += 1
-                processed_frame = process_frame(frame, name, frame_counters[name], person_trackers[name])
-                frames.append(processed_frame)
+                snapshots.append((name, frame))
             else:
                 print(f"Failed to read from {name}")
+
+        frames = []
+        for name, frame in snapshots:
+            frame_counters[name] += 1
+            processed_frame = process_frame(
+                frame, name, frame_counters[name], person_trackers[name]
+            )
+            frames.append(processed_frame)
 
         if frames:
             if len(frames) == 1:
