@@ -17,7 +17,7 @@ _working_rtsp_urls = {}
 _open_camera_lock = threading.Lock()
 
 # Initialize screenshot manager with 30-second reset time
-screenshot_manager = ScreenshotManager(reset_time_seconds=30)
+screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 
 # Load both YOLO models
 boots_model = YOLO("best11.pt")
@@ -52,16 +52,28 @@ PPE_CLASSES = {
     9: "Vehicle"
 }
 
-# Show boots, goggles, and Person from boots model
-BOOTS_SHOW_LABELS = {"boots", "no_boots", "goggles", "no_goggle", "Person"}
-BOOTS_VIOLATION_LABELS = {"no_boots", "no_goggle"}
+# ---------------------------------------------------------------------------
+# PPE item classes we care about for the person-level compliance decision.
+# "positive" = the item IS being worn. "negative" = the model explicitly says
+# it is NOT being worn. Anything not seen at all for a person is left as
+# "unknown" rather than assumed compliant or a violation.
+# ---------------------------------------------------------------------------
+HELMET_POSITIVE = {"helmet", "Hardhat"}
+HELMET_NEGATIVE = {"no_helmet", "NO-Hardhat"}
+VEST_POSITIVE = {"vest", "Safety Vest"}
+VEST_NEGATIVE = {"NO-Safety Vest"}
 
-# Only these get drawn from the PPE model
-PPE_SHOW_LABELS = {"Hardhat", "NO-Hardhat", "Safety Vest", "NO-Safety Vest", "Person"}
-PPE_VIOLATION_LABELS = {"NO-Hardhat", "NO-Safety Vest"}
+# All the item labels we bother drawing/considering (Person is handled separately)
+ITEM_LABELS = HELMET_POSITIVE | HELMET_NEGATIVE | VEST_POSITIVE | VEST_NEGATIVE | {
+    "boots", "no_boots", "goggles", "no_goggle", "gloves", "no_gloves"
+}
 
 # Confidence threshold for Person class only (lowered to 30% to detect more people)
 PERSON_CONFIDENCE_THRESHOLD = 0.30
+
+# Fraction of an item's own box area that must fall inside a person's box
+# for that item to be considered "worn by" that person.
+ITEM_CONTAINMENT_THRESHOLD = 0.5
 
 # Performance optimization settings
 PROCESS_EVERY_N_FRAMES = 40  # Process every Nth frame to improve performance
@@ -70,6 +82,10 @@ MODEL_INPUT_SIZE = 192       # Smaller input size for faster inference
 # Person tracking settings
 MAX_MISSING_FRAMES = 10  # Remove tracked person after 10 consecutive frames without detection
 IOU_THRESHOLD = 0.3       # Intersection over Union threshold for matching detections to tracks
+
+RED = (0, 0, 255)
+GREEN = (0, 255, 0)
+YELLOW = (0, 255, 255)
 
 
 def calculate_iou(box1, box2):
@@ -97,41 +113,123 @@ def calculate_iou(box1, box2):
     return intersection / union
 
 
+def containment_ratio(inner_box, outer_box):
+    """
+    Fraction of inner_box's own area that lies inside outer_box.
+    Used to decide whether a small item box (helmet, vest, ...) belongs
+    to a given person's (much bigger) box.
+    """
+    ix1, iy1, ix2, iy2 = inner_box
+    ox1, oy1, ox2, oy2 = outer_box
+
+    x1 = max(ix1, ox1)
+    y1 = max(iy1, oy1)
+    x2 = min(ix2, ox2)
+    y2 = min(iy2, oy2)
+
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    inter = (x2 - x1) * (y2 - y1)
+    inner_area = (ix2 - ix1) * (iy2 - iy1)
+
+    if inner_area <= 0:
+        return 0.0
+
+    return inter / inner_area
+
+
+def classify_person_ppe(person_box, item_detections):
+    """
+    Given one person's box and every item detection from this frame,
+    decide the person's helmet/vest status.
+
+    Returns a dict:
+        {
+            'helmet': 'present' | 'missing' | 'unknown',
+            'vest':   'present' | 'missing' | 'unknown',
+            'missing_items': [...],
+            'is_violation': bool,
+            'is_fully_compliant': bool,
+            'label': str,
+        }
+    """
+    helmet_positive_seen = False
+    helmet_negative_seen = False
+    vest_positive_seen = False
+    vest_negative_seen = False
+
+    for item in item_detections:
+        if containment_ratio(item['box'], person_box) < ITEM_CONTAINMENT_THRESHOLD:
+            continue
+
+        label = item['label']
+        if label in HELMET_POSITIVE:
+            helmet_positive_seen = True
+        elif label in HELMET_NEGATIVE:
+            helmet_negative_seen = True
+        elif label in VEST_POSITIVE:
+            vest_positive_seen = True
+        elif label in VEST_NEGATIVE:
+            vest_negative_seen = True
+
+    # An explicit "NO-..." detection always wins over a positive one for
+    # the same item, since the model is actively flagging a violation.
+    if helmet_negative_seen:
+        helmet_status = "missing"
+    elif helmet_positive_seen:
+        helmet_status = "present"
+    else:
+        helmet_status = "unknown"
+
+    if vest_negative_seen:
+        vest_status = "missing"
+    elif vest_positive_seen:
+        vest_status = "present"
+    else:
+        vest_status = "unknown"
+
+    missing_items = []
+    if helmet_status == "missing":
+        missing_items.append("Helmet")
+    if vest_status == "missing":
+        missing_items.append("Vest")
+
+    is_violation = len(missing_items) > 0
+    is_fully_compliant = (helmet_status == "present" and vest_status == "present")
+
+    if is_violation:
+        label_text = "NO " + " & NO ".join(missing_items)
+    elif is_fully_compliant:
+        label_text = "Helmet + Vest OK"
+    else:
+        label_text = "Person"
+
+    return {
+        "helmet": helmet_status,
+        "vest": vest_status,
+        "missing_items": missing_items,
+        "is_violation": is_violation,
+        "is_fully_compliant": is_fully_compliant,
+        "label": label_text,
+    }
+
+
 class PersonTracker:
-    """Track persons across frames to maintain persistent green boxes"""
+    """Track persons across frames to maintain persistent boxes + PPE status"""
 
     def __init__(self):
-        self.tracks = {}  # {track_id: {'box': [x1, y1, x2, y2], 'missing_frames': 0, 'label': str}}
+        self.tracks = {}  # {track_id: {'box', 'missing_frames', 'confidence', 'status'}}
         self.next_id = 0
 
     def calculate_iou(self, box1, box2):
-        x1_1, y1_1, x2_1, y2_1 = box1
-        x1_2, y1_2, x2_2, y2_2 = box2
-
-        x1_i = max(x1_1, x1_2)
-        y1_i = max(y1_1, y1_2)
-        x2_i = min(x2_1, x2_2)
-        y2_i = min(y2_1, y2_2)
-
-        if x2_i <= x1_i or y2_i <= y1_i:
-            return 0.0
-
-        intersection = (x2_i - x1_i) * (y2_i - y1_i)
-
-        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-        union = area1 + area2 - intersection
-
-        if union == 0:
-            return 0.0
-
-        return intersection / union
+        return calculate_iou(box1, box2)
 
     def update(self, detected_persons):
         """
-        Update tracks with new detections
-        detected_persons: list of {'box': [x1, y1, x2, y2], 'label': str, 'confidence': float}
-        Returns: list of all active tracks with their boxes and labels
+        Update tracks with new detections.
+        detected_persons: list of {'box': [x1, y1, x2, y2], 'confidence': float, 'status': dict}
+        Returns: list of all active tracks with their boxes, confidence and PPE status
         """
         for track_id in self.tracks:
             self.tracks[track_id]['missing_frames'] += 1
@@ -155,24 +253,23 @@ class PersonTracker:
             if best_track_id is not None:
                 self.tracks[best_track_id]['box'] = detection_box
                 self.tracks[best_track_id]['missing_frames'] = 0
-                self.tracks[best_track_id]['label'] = detection['label']
                 self.tracks[best_track_id]['confidence'] = detection['confidence']
+                self.tracks[best_track_id]['status'] = detection['status']
                 matched_track_ids.add(best_track_id)
             else:
                 self.tracks[self.next_id] = {
                     'box': detection_box,
                     'missing_frames': 0,
-                    'label': detection['label'],
-                    'confidence': detection['confidence']
+                    'confidence': detection['confidence'],
+                    'status': detection['status'],
                 }
                 matched_track_ids.add(self.next_id)
                 self.next_id += 1
 
-        tracks_to_remove = []
-        for track_id, track in self.tracks.items():
-            if track['missing_frames'] > MAX_MISSING_FRAMES:
-                tracks_to_remove.append(track_id)
-
+        tracks_to_remove = [
+            track_id for track_id, track in self.tracks.items()
+            if track['missing_frames'] > MAX_MISSING_FRAMES
+        ]
         for track_id in tracks_to_remove:
             del self.tracks[track_id]
 
@@ -180,8 +277,8 @@ class PersonTracker:
             {
                 'track_id': track_id,
                 'box': track['box'],
-                'label': track['label'],
-                'confidence': track['confidence']
+                'confidence': track['confidence'],
+                'status': track['status'],
             }
             for track_id, track in self.tracks.items()
         ]
@@ -237,7 +334,6 @@ def build_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
     ]
 
 
-
 # List every channel number the NVR has a camera attached to (from your
 # NVR's Camera Management list this was D1 and D2, i.e. channels 1 and 2).
 # Add more numbers here if you connect additional cameras later.
@@ -259,25 +355,49 @@ CAMERA_CONFIGS = [
 CAMERA_LOCATIONS = {config["name"]: config.get("location", "Unknown") for config in CAMERA_CONFIGS}
 
 
-def process_frame(frame, camera_name, frame_count, person_tracker):
-    """Process a single frame with both models"""
-    detected_violations = set()
-    violating_persons = []
-    detected_persons = []
+def draw_person_box(annotated, box, status, confidence, track_id=None):
+    """
+    Draws ONE box per person (green if compliant/unknown, red if a
+    violation was found), a dimensions readout, and the PPE status label.
+    """
+    x1, y1, x2, y2 = box
+    width = x2 - x1
+    height = y2 - y1
 
+    color = RED if status["is_violation"] else GREEN
+
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 5)
+
+    id_part = f"ID{track_id} " if track_id is not None else ""
+    dims_text = f"{id_part}W:{width} H:{height} ({confidence:.2f})"
+    cv2.putText(annotated, dims_text, (x1, max(15, y1 - 25)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    cv2.putText(annotated, status["label"], (x1, max(15, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return width, height
+
+
+def process_frame(frame, camera_name, frame_count, person_tracker):
+    """
+    Person-first pipeline:
+      1. Detect every person (from both models).
+      2. Detect every PPE item (helmet/no_helmet, vest/no_vest, etc.).
+      3. For each person, decide helmet/vest status from the items that
+         fall inside that person's box.
+      4. Draw ONE box per person: green + dimensions while compliant/
+         unknown, red + "NO Helmet / NO Vest" label the moment either
+         item is confirmed missing.
+    """
+    violating_persons = []
     annotated = frame.copy()
 
     if frame_count % PROCESS_EVERY_N_FRAMES != 0:
         active_tracks = person_tracker.update([])
         for track in active_tracks:
-            x1, y1, x2, y2 = track['box']
-            label = track['label']
-            confidence = track['confidence']
-            color = (0, 255, 0)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(annotated, f"{label} {confidence:.2f}",
-                        (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, color, 2)
+            draw_person_box(annotated, track['box'], track['status'],
+                             track['confidence'], track['track_id'])
 
         cv2.putText(annotated, camera_name, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -285,96 +405,18 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
 
     # ---- Run boots model with smaller input size ----
     boots_results = boots_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
-    boots_detections = []
+    raw_detections = []
 
     for result in boots_results:
         for box in result.boxes:
             class_id = int(box.cls[0])
             confidence = float(box.conf[0])
             label = BOOTS_CLASSES.get(class_id, str(class_id))
-
-            if label not in BOOTS_SHOW_LABELS:
-                continue
-
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-            boots_detections.append({
-                'box': [x1, y1, x2, y2],
-                'label': label,
-                'confidence': confidence
-            })
-
-    # Mutual exclusion: boots/no_boots and goggles/no_goggle
-    filtered_boots_detections = []
-    used_boots_indices = set()
-
-    for i, det1 in enumerate(boots_detections):
-        if i in used_boots_indices:
-            continue
-
-        label1 = det1['label']
-        box1 = det1['box']
-
-        conflicting_indices = []
-        for j, det2 in enumerate(boots_detections):
-            if i == j or j in used_boots_indices:
-                continue
-
-            label2 = det2['label']
-            box2 = det2['box']
-
-            is_conflicting = (
-                (label1 == "boots" and label2 == "no_boots") or
-                (label1 == "no_boots" and label2 == "boots") or
-                (label1 == "goggles" and label2 == "no_goggle") or
-                (label1 == "no_goggle" and label2 == "goggles")
-            )
-
-            if is_conflicting:
-                iou = calculate_iou(box1, box2)
-                if iou > 0.3:
-                    conflicting_indices.append(j)
-
-        if conflicting_indices:
-            all_indices = [i] + conflicting_indices
-            best_idx = max(all_indices, key=lambda idx: boots_detections[idx]['confidence'])
-            filtered_boots_detections.append(boots_detections[best_idx])
-            used_boots_indices.update(all_indices)
-        else:
-            filtered_boots_detections.append(det1)
-            used_boots_indices.add(i)
-
-    for detection in filtered_boots_detections:
-        x1, y1, x2, y2 = detection['box']
-        label = detection['label']
-        confidence = detection['confidence']
-
-        if label == "Person":
-            detected_persons.append({
-                'box': [x1, y1, x2, y2],
-                'label': label,
-                'confidence': confidence
-            })
-
-        if label in BOOTS_VIOLATION_LABELS:
-            color = (0, 0, 255)
-            detected_violations.add(label)
-            violating_persons.append({
-                'label': label,
-                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                'confidence': confidence
-            })
-        else:
-            color = (0, 255, 0)
-
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated, f"{label} {confidence:.2f}",
-                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
+            raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
 
     # ---- Run PPE model with smaller input size ----
     ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
-    ppe_detections = []
 
     for result in ppe_results:
         for box in result.boxes:
@@ -385,88 +427,50 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
             if label == "Person" and confidence < PERSON_CONFIDENCE_THRESHOLD:
                 continue
 
-            if label not in PPE_SHOW_LABELS:
-                continue
-
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+            raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
 
-            ppe_detections.append({
-                'box': [x1, y1, x2, y2],
-                'label': label,
-                'confidence': confidence
-            })
+    # Split into persons vs PPE items
+    person_detections = [d for d in raw_detections if d['label'] == "Person"]
+    item_detections = [d for d in raw_detections if d['label'] in ITEM_LABELS]
 
-    # Mutual exclusion: Hardhat/NO-Hardhat and Safety Vest/NO-Safety Vest
-    filtered_detections = []
-    used_indices = set()
-
-    for i, det1 in enumerate(ppe_detections):
-        if i in used_indices:
+    # De-duplicate overlapping person boxes coming from the two models
+    # (keep the highest-confidence box out of any pair that overlaps a lot)
+    deduped_persons = []
+    used = set()
+    for i, p1 in enumerate(person_detections):
+        if i in used:
             continue
-
-        label1 = det1['label']
-        box1 = det1['box']
-
-        conflicting_indices = []
-        for j, det2 in enumerate(ppe_detections):
-            if i == j or j in used_indices:
+        group = [i]
+        for j, p2 in enumerate(person_detections):
+            if j <= i or j in used:
                 continue
+            if calculate_iou(p1['box'], p2['box']) > 0.5:
+                group.append(j)
+        best = max(group, key=lambda idx: person_detections[idx]['confidence'])
+        deduped_persons.append(person_detections[best])
+        used.update(group)
 
-            label2 = det2['label']
-            box2 = det2['box']
+    detected_persons = []
+    for person in deduped_persons:
+        status = classify_person_ppe(person['box'], item_detections)
+        detected_persons.append({
+            'box': person['box'],
+            'confidence': person['confidence'],
+            'status': status,
+        })
 
-            is_conflicting = (
-                (label1 == "Hardhat" and label2 == "NO-Hardhat") or
-                (label1 == "NO-Hardhat" and label2 == "Hardhat") or
-                (label1 == "Safety Vest" and label2 == "NO-Safety Vest") or
-                (label1 == "NO-Safety Vest" and label2 == "Safety Vest")
-            )
-
-            if is_conflicting:
-                iou = calculate_iou(box1, box2)
-                if iou > 0.3:
-                    conflicting_indices.append(j)
-
-        if conflicting_indices:
-            all_indices = [i] + conflicting_indices
-            best_idx = max(all_indices, key=lambda idx: ppe_detections[idx]['confidence'])
-            filtered_detections.append(ppe_detections[best_idx])
-            used_indices.update(all_indices)
-        else:
-            filtered_detections.append(det1)
-            used_indices.add(i)
-
-    for detection in filtered_detections:
-        x1, y1, x2, y2 = detection['box']
-        label = detection['label']
-        confidence = detection['confidence']
-
-        if label == "Person":
-            detected_persons.append({
-                'box': [x1, y1, x2, y2],
-                'label': label,
-                'confidence': confidence
-            })
-
-        if label in PPE_VIOLATION_LABELS:
-            color = (0, 0, 255)
-            detected_violations.add(label)
+        if status["is_violation"]:
             violating_persons.append({
-                'label': label,
-                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                'confidence': confidence
+                'label': " & ".join(status["missing_items"]),
+                'x1': person['box'][0], 'y1': person['box'][1],
+                'x2': person['box'][2], 'y2': person['box'][3],
+                'confidence': person['confidence'],
             })
-        else:
-            color = (0, 255, 0)
 
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated, f"{label} {confidence:.2f}",
-                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
-
-    if detected_violations:
+    if violating_persons:
         alarm.play()
-        print(f"Violations detected: {detected_violations}")
+        print(f"Violations detected: {[p['label'] for p in violating_persons]}")
         print(f"Violating persons count: {len(violating_persons)}")
         screenshot_result = screenshot_manager.take_screenshot(
             frame, violating_persons, camera_name=camera_name
@@ -487,14 +491,8 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     active_tracks = person_tracker.update(detected_persons)
 
     for track in active_tracks:
-        x1, y1, x2, y2 = track['box']
-        label = track['label']
-        confidence = track['confidence']
-        color = (0, 255, 0)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated, f"{label} {confidence:.2f}",
-                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
+        draw_person_box(annotated, track['box'], track['status'],
+                         track['confidence'], track['track_id'])
 
     cv2.putText(annotated, camera_name, (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
