@@ -9,7 +9,7 @@ import threading
 
 # Initialize alarm
 alarm = Alarm()
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 
 RTSP_OPEN_TIMEOUT_MS = 5000
@@ -297,7 +297,7 @@ class PersonTracker:
 
 RAW_USERNAME = "admin"
 RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.100.218"
+NVR_IP = "192.168.100.21"
 RTSP_PORT = 554
 
 USER_ENC = quote(RAW_USERNAME, safe="")
