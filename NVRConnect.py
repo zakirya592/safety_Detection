@@ -6,6 +6,7 @@ from screenshot import ScreenshotManager
 from detection_alert_db import save_detection_alerts_async
 import os
 import threading
+from dotenv import load_dotenv
 
 # Initialize alarm
 alarm = Alarm()
@@ -335,10 +336,10 @@ class PersonTracker:
 # on the LAST "@", so the password and part of the host get merged into
 # garbage). Never include the un-encoded form as a fallback.
 
-RAW_USERNAME = "admin"
-RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.100.221"
-RTSP_PORT = 554
+RAW_USERNAME = os.environ.get("NVR_USER_NAME")
+RAW_PASSWORD = os.environ.get("RAW_PASSWORD")
+NVR_IP = os.environ.get("NVR_IP")
+RTSP_PORT = os.environ.get("RTSP_PORT")
 
 USER_ENC = quote(RAW_USERNAME, safe="")
 PASS_ENC = quote(RAW_PASSWORD, safe="")
