@@ -20,22 +20,19 @@ _open_camera_lock = threading.Lock()
 screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 
 # Load both YOLO models
-boots_model = YOLO("best11.pt")
+boots_model = YOLO("bestsss.pt")
 ppe_model = YOLO("best.pt")
 
 # Class mapping for the boots model
 BOOTS_CLASSES = {
-    0: "helmet",
-    1: "gloves",
-    2: "vest",
-    3: "boots",
-    4: "goggles",
-    5: "none",
-    6: "Person",
-    7: "no_helmet",
-    8: "no_goggle",
-    9: "no_gloves",
-    10: "no_boots"
+    0: "glove",
+    1: "goggles",
+    2: "helmet",
+    3: "mask",
+    4: "no_glove",
+    5: "no_goggles",
+    6: "no_helmet",
+    7: "no_mask",
 }
 
 # Class mapping for the PPE model
@@ -62,11 +59,15 @@ HELMET_POSITIVE = {"helmet", "Hardhat"}
 HELMET_NEGATIVE = {"no_helmet", "NO-Hardhat"}
 VEST_POSITIVE = {"vest", "Safety Vest"}
 VEST_NEGATIVE = {"NO-Safety Vest"}
+GLOVE_POSITIVE = {"glove"}
+GLOVE_NEGATIVE = {"no_glove"}
+
+GOGGLES_POSITIVE = {"goggles"}
+GOGGLES_NEGATIVE = {"no_goggles"}
 
 # All the item labels we bother drawing/considering (Person is handled separately)
-ITEM_LABELS = HELMET_POSITIVE | HELMET_NEGATIVE | VEST_POSITIVE | VEST_NEGATIVE | {
-    "boots", "no_boots", "goggles", "no_goggle", "gloves", "no_gloves"
-}
+ITEM_LABELS = HELMET_POSITIVE | HELMET_NEGATIVE | VEST_POSITIVE | VEST_NEGATIVE | GLOVE_POSITIVE | GLOVE_NEGATIVE | GOGGLES_POSITIVE | GOGGLES_NEGATIVE
+
 
 # Confidence threshold for Person class only (lowered to 30% to detect more people)
 PERSON_CONFIDENCE_THRESHOLD = 0.30
@@ -148,6 +149,8 @@ def classify_person_ppe(person_box, item_detections):
         {
             'helmet': 'present' | 'missing' | 'unknown',
             'vest':   'present' | 'missing' | 'unknown',
+            'gloves': 'present' | 'missing' | 'unknown',
+            'goggles': 'present' | 'missing' | 'unknown',
             'missing_items': [...],
             'is_violation': bool,
             'is_fully_compliant': bool,
@@ -158,6 +161,11 @@ def classify_person_ppe(person_box, item_detections):
     helmet_negative_seen = False
     vest_positive_seen = False
     vest_negative_seen = False
+
+    glove_positive_seen = False
+    glove_negative_seen = False
+    goggles_positive_seen = False
+    goggles_negative_seen = False
 
     for item in item_detections:
         if containment_ratio(item['box'], person_box) < ITEM_CONTAINMENT_THRESHOLD:
@@ -172,6 +180,16 @@ def classify_person_ppe(person_box, item_detections):
             vest_positive_seen = True
         elif label in VEST_NEGATIVE:
             vest_negative_seen = True
+
+        elif label in GLOVE_POSITIVE:
+            glove_positive_seen = True
+        elif label in GLOVE_NEGATIVE:
+            glove_negative_seen = True
+        elif label in GOGGLES_POSITIVE:
+            goggles_positive_seen = True
+        elif label in GOGGLES_NEGATIVE:
+            goggles_negative_seen = True
+        
 
     # An explicit "NO-..." detection always wins over a positive one for
     # the same item, since the model is actively flagging a violation.
@@ -188,6 +206,21 @@ def classify_person_ppe(person_box, item_detections):
         vest_status = "present"
     else:
         vest_status = "unknown"
+    
+    if glove_negative_seen:
+        glove_status = "missing"
+    elif glove_positive_seen:
+        glove_status = "present"
+    else:
+        glove_status = "unknown"
+
+    if goggles_negative_seen:
+        goggles_status = "missing"
+    elif goggles_positive_seen:
+        goggles_status = "present"
+    else:
+        goggles_status = "unknown"
+    
 
     missing_items = []
     if helmet_status == "missing":
@@ -195,19 +228,26 @@ def classify_person_ppe(person_box, item_detections):
     if vest_status == "missing":
         missing_items.append("Vest")
 
+    if glove_status == "missing":
+        missing_items.append("Gloves")
+    if goggles_status == "missing":
+        missing_items.append("Goggles")
+
     is_violation = len(missing_items) > 0
-    is_fully_compliant = (helmet_status == "present" and vest_status == "present")
+    is_fully_compliant = (helmet_status == "present" and vest_status == "present" and glove_status == "present" and goggles_status == "present")
 
     if is_violation:
-        label_text = "NO " + " & NO ".join(missing_items)
+        label_text = "Missing " + " , ".join(missing_items)
     elif is_fully_compliant:
-        label_text = "Helmet + Vest OK"
+        label_text = "Helmet + Vest + Gloves + Goggles OK"
     else:
         label_text = "Person"
 
     return {
         "helmet": helmet_status,
         "vest": vest_status,
+        "gloves": glove_status,
+        "goggles": goggles_status,
         "missing_items": missing_items,
         "is_violation": is_violation,
         "is_fully_compliant": is_fully_compliant,
@@ -297,7 +337,7 @@ class PersonTracker:
 
 RAW_USERNAME = "admin"
 RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.100.21"
+NVR_IP = "192.168.100.221"
 RTSP_PORT = 554
 
 USER_ENC = quote(RAW_USERNAME, safe="")
@@ -549,11 +589,6 @@ def main():
             caps.append((cap, name))
 
     if not caps:
-        print("No cameras connected. Exiting...")
-        print("If every URL failed with '401 Unauthorized', the RTSP")
-        print("username/password is wrong (or the NVR's RTSP-auth account")
-        print("is different from its web-login account) - verify with VLC")
-        print("(Media > Open Network Stream) before re-running this script.")
         return
 
     print(f"Connected to {len(caps)} camera(s). Press 'q' to quit.")

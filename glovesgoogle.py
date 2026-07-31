@@ -11,55 +11,35 @@ alarm = Alarm()
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 
-# Initialize screenshot manager with 30-second reset time
 screenshot_manager = ScreenshotManager(reset_time_seconds=30)
 
 # Load the boots/PPE model
-boots_model = YOLO("best11.pt")
+boots_model = YOLO("bestsss.pt")
 
-# Print the model's actual class mapping once at startup. If this doesn't
-# match BOOTS_CLASSES below (e.g. because the model was retrained and the
-# class order shifted), goggles/gloves detections will silently be labeled
-# as something else or filtered out entirely. Compare this printed dict
-# against BOOTS_CLASSES and fix BOOTS_CLASSES if they disagree.
 print(f"boots_model.names: {boots_model.names}")
 
 # Class mapping for the boots model
 BOOTS_CLASSES = {
-    0: "helmet",
-    1: "gloves",
-    2: "vest",
-    3: "boots",
-    4: "goggles",
-    5: "none",
-    6: "Person",
-    7: "no_helmet",
-    8: "no_goggle",
-    9: "no_gloves",
-    10: "no_boots"
+    0: "glove",
+    1: "goggles",
+    2: "helmet",
+    3: "mask",
+    4: "no_glove",
+    5: "no_goggles",
+    6: "no_helmet",
+    7: "no_mask",
 }
 
-# Show boots, vest, goggles, gloves, and Person from the boots model
-# (boots/no_boots excluded per requirements; no PPE model needed anymore
-# since this model already covers boots/vest/goggles/gloves)
 BOOTS_SHOW_LABELS = {
-    "helmet", "no_helmet",
-    "vest",
-    "boots", "no_boots",
-    "goggles", "no_goggle",
-    "gloves", "no_gloves",
-    "Person"
+    "glove", "no_glove",
+    # "helmet", "no_helmet",
+    # "mask", "no_mask",
+    "goggles", "no_goggles",
 }
-BOOTS_VIOLATION_LABELS = {"no_boots", "no_goggle", "no_gloves"}
+BOOTS_VIOLATION_LABELS = {"no_glove", "no_goggles"}
 
-# Confidence threshold for Person class only (lowered to 30% to detect more people)
 PERSON_CONFIDENCE_THRESHOLD = 0.30
 
-# Set True temporarily to print every raw boots-model detection (class id,
-# label, confidence) before any filtering. Use this to confirm goggles/
-# gloves are actually being detected by the model at all, and that the
-# class_id -> label mapping in BOOTS_CLASSES matches what the model was
-# trained with. Turn back off once goggles/gloves are confirmed working.
 DEBUG_RAW_DETECTIONS = True
 
 # Performance optimization settings
@@ -189,13 +169,6 @@ class PersonTracker:
 # ---------------------------------------------------------------------------
 # Camera / NVR configuration
 # ---------------------------------------------------------------------------
-# IMPORTANT: build RTSP URLs with urllib.parse.quote so special characters
-# in the username/password (like "@") are always encoded correctly and
-# consistently. Hand-typing "%40" in a string is error-prone and, if you
-# accidentally also include the raw "@" version, that raw version is
-# actually an invalid URL (two "@" symbols confuses the parser: it splits
-# on the LAST "@", so the password and part of the host get merged into
-# garbage). Never include the un-encoded form as a fallback.
 
 RAW_USERNAME = "admin"
 RAW_PASSWORD = "Eisa@1234"
@@ -344,12 +317,10 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
             box2 = det2['box']
 
             is_conflicting = (
-                (label1 == "goggles" and label2 == "no_goggle") or
-                (label1 == "no_goggle" and label2 == "goggles") or
-                (label1 == "gloves" and label2 == "no_gloves") or
-                (label1 == "no_gloves" and label2 == "gloves") or
-                (label1 == "boots" and label2 == "no_boots") or
-                (label1 == "no_boots" and label2 == "boots")
+                (label1 == "goggles" and label2 == "no_goggles") or
+                (label1 == "no_goggles" and label2 == "goggles") or
+                (label1 == "glove" and label2 == "no_glove") or
+                (label1 == "no_glove" and label2 == "glove")
             )
 
             if is_conflicting:
