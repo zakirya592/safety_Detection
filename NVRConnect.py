@@ -56,9 +56,9 @@ PPE_CLASSES = {
 # it is NOT being worn. Anything not seen at all for a person is left as
 # "unknown" rather than assumed compliant or a violation.
 # ---------------------------------------------------------------------------
-HELMET_POSITIVE = {"helmet", "Hardhat"}
-HELMET_NEGATIVE = {"no_helmet", "NO-Hardhat"}
-VEST_POSITIVE = {"vest", "Safety Vest"}
+HELMET_POSITIVE = {"Hardhat"}
+HELMET_NEGATIVE = {"NO-Hardhat"}
+VEST_POSITIVE = {"Safety Vest"}
 VEST_NEGATIVE = {"NO-Safety Vest"}
 GLOVE_POSITIVE = {"glove"}
 GLOVE_NEGATIVE = {"no_glove"}
@@ -118,7 +118,7 @@ def calculate_iou(box1, box2):
 def containment_ratio(inner_box, outer_box):
     """
     Fraction of inner_box's own area that lies inside outer_box.
-    Used to decide whether a small item box (helmet, vest, ...) belongs
+    Used to decide whether a small item box (Hardhat, vest, ...) belongs
     to a given person's (much bigger) box.
     """
     ix1, iy1, ix2, iy2 = inner_box
@@ -144,11 +144,11 @@ def containment_ratio(inner_box, outer_box):
 def classify_person_ppe(person_box, item_detections):
     """
     Given one person's box and every item detection from this frame,
-    decide the person's helmet/vest status.
+    decide the person's Hardhat/vest status.
 
     Returns a dict:
         {
-            'helmet': 'present' | 'missing' | 'unknown',
+            'Hardhat': 'present' | 'missing' | 'unknown',
             'vest':   'present' | 'missing' | 'unknown',
             'gloves': 'present' | 'missing' | 'unknown',
             'goggles': 'present' | 'missing' | 'unknown',
@@ -225,7 +225,7 @@ def classify_person_ppe(person_box, item_detections):
 
     missing_items = []
     if helmet_status == "missing":
-        missing_items.append("Helmet")
+        missing_items.append("Hardhat")
     if vest_status == "missing":
         missing_items.append("Vest")
 
@@ -240,12 +240,12 @@ def classify_person_ppe(person_box, item_detections):
     if is_violation:
         label_text = "Missing " + " , ".join(missing_items)
     elif is_fully_compliant:
-        label_text = "Helmet + Vest + Gloves + Goggles OK"
+        label_text = "Hardhat + Vest + Gloves + Goggles OK"
     else:
         label_text = "Person"
 
     return {
-        "helmet": helmet_status,
+        "Hardhat": helmet_status,
         "vest": vest_status,
         "gloves": glove_status,
         "goggles": goggles_status,
@@ -424,11 +424,11 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     """
     Person-first pipeline:
       1. Detect every person (from both models).
-      2. Detect every PPE item (helmet/no_helmet, vest/no_vest, etc.).
-      3. For each person, decide helmet/vest status from the items that
+      2. Detect every PPE item (Hardhat/no_helmet, vest/no_vest, etc.).
+      3. For each person, decide Hardhat/vest status from the items that
          fall inside that person's box.
       4. Draw ONE box per person: green + dimensions while compliant/
-         unknown, red + "NO Helmet / NO Vest" label the moment either
+         unknown, red + "NO Hardhat / NO Vest" label the moment either
          item is confirmed missing.
     """
     violating_persons = []
