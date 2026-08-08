@@ -43,7 +43,7 @@ PERSON_CONFIDENCE_THRESHOLD = 0.30
 DEBUG_RAW_DETECTIONS = True
 
 # Performance optimization settings
-PROCESS_EVERY_N_FRAMES = 10  # Process every Nth frame to improve performance
+PROCESS_EVERY_N_FRAMES = 30  # Process every Nth frame to improve performance
 MODEL_INPUT_SIZE = 640       # Smaller input size for faster inference
 
 # Person tracking settings
@@ -172,7 +172,7 @@ class PersonTracker:
 
 RAW_USERNAME = "admin"
 RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.100.221"
+NVR_IP = "192.168.100.47"
 RTSP_PORT = 554
 
 USER_ENC = quote(RAW_USERNAME, safe="")
@@ -200,7 +200,7 @@ def build_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
 
         # Uniview-style (matches the IPC2122LB cameras / Uniview NVR)
         f"rtsp://{auth}/unicast/c{channel}/s0/live",
-        f"rtsp://{auth}/unicast/c{channel}/s1/live",
+        # f"rtsp://{auth}/unicast/c{channel}/s1/live",
         f"rtsp://{auth}/media/video{channel}",
 
         # Generic fallbacks
@@ -239,6 +239,9 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
 
     annotated = frame
 
+    if frame_count == 1:
+        print(camera_name, "Frame Shape:", frame.shape)
+
     if frame_count % PROCESS_EVERY_N_FRAMES != 0:
         active_tracks = person_tracker.update([])
         for track in active_tracks:
@@ -255,21 +258,35 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         return annotated
         
-    small_frame = cv2.resize(frame, (640, 360))
+    # small_frame = cv2.resize(frame, (640, 360))
+    small_frame = frame.copy()
     # ---- Run boots model with smaller input size ----
-    boots_results = boots_model( source=small_frame,
-    imgsz=640,
-    conf=0.25,
-    stream=True,
-    verbose=False)
-
+    # boots_results = boots_model( source=small_frame,
+    # imgsz=920,
+    # conf=0.10,
+    # verbose=False)
+    boots_results = boots_model.predict(
+    source=small_frame,
+    imgsz=960,
+    conf=0.01,
+    verbose=False
+)
     boots_detections = []
 
     for result in boots_results:
+        print("Total boxes:", len(result.boxes))
+
         for box in result.boxes:
+
             class_id = int(box.cls[0])
             confidence = float(box.conf[0])
             # label = BOOTS_CLASSES.get(class_id, str(class_id))
+            print(
+                "RAW",
+                boots_model.names[class_id],
+                confidence
+            )
+            
             label = str(boots_model.names[class_id]).strip()
 
             if DEBUG_RAW_DETECTIONS:
@@ -281,21 +298,26 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
             # x1, y1, x2, y2 = map(int, box.xyxy[0])
             h, w = frame.shape[:2]
 
-            sx = w / 640
-            sy = h / 360
+            # sx = w / 640
+            # sy = h / 360
 
+            # x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            # x1 = int(x1 * sx)
+            # y1 = int(y1 * sy)
+            # x2 = int(x2 * sx)
+            # y2 = int(y2 * sy)
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-            x1 = int(x1 * sx)
-            y1 = int(y1 * sy)
-            x2 = int(x2 * sx)
-            y2 = int(y2 * sy)
 
             boots_detections.append({
                 'box': [x1, y1, x2, y2],
                 'label': label,
                 'confidence': confidence
             })
+            print(
+                f"Label={boots_model.names[class_id]} "
+                f"Conf={confidence:.3f}"
+            )
 
     # Mutual exclusion: goggles/no_goggle, gloves/no_gloves
     filtered_boots_detections = []
@@ -418,7 +440,7 @@ def open_camera(config):
         # cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         # cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, 30)
 
         if not cap.isOpened():
@@ -428,10 +450,13 @@ def open_camera(config):
         ret, frame = cap.read()
         if ret and frame is not None:
             print(f"  Connected using: {safe_log_url}")
+            print("Camera:", config["name"])
+            print("Width :", cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            print("Height:", cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             return cap, config['name']
 
         cap.release()
-
+       
     print(f"Failed to connect to {config['name']} after trying all URL formats")
     return None, None
 
@@ -457,7 +482,7 @@ def main():
             success, frame = cap.read()
             # while cap.grab():
             #     pass
-            cap.grab()
+            # cap.grab()
             # success, frame = cap.retrieve()
             if success:
                 frame_counters[name] += 1

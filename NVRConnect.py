@@ -7,6 +7,7 @@ from detection_alert_db import save_detection_alerts_async
 import os
 import threading
 from dotenv import load_dotenv
+import time
 
 # Initialize alarm
 alarm = Alarm()
@@ -16,6 +17,15 @@ os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 RTSP_OPEN_TIMEOUT_MS = 5000
 _working_rtsp_urls = {}
 _open_camera_lock = threading.Lock()
+
+# ===========================================
+# Parallel Camera Processing
+# ===========================================
+
+latest_frames = {}
+frame_lock = threading.Lock()
+
+running = True
 
 # Initialize screenshot manager with 30-second reset time
 screenshot_manager = ScreenshotManager(reset_time_seconds=15)
@@ -78,8 +88,8 @@ PERSON_CONFIDENCE_THRESHOLD = 0.30
 ITEM_CONTAINMENT_THRESHOLD = 0.5
 
 # Performance optimization settings
-PROCESS_EVERY_N_FRAMES = 40  # Process every Nth frame to improve performance
-MODEL_INPUT_SIZE = 192       # Smaller input size for faster inference
+PROCESS_EVERY_N_FRAMES = 20  # Process every Nth frame to improve performance
+MODEL_INPUT_SIZE = 320       # Smaller input size for faster inference
 
 # Person tracking settings
 MAX_MISSING_FRAMES = 10  # Remove tracked person after 10 consecutive frames without detection
@@ -432,7 +442,7 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
          item is confirmed missing.
     """
     violating_persons = []
-    annotated = frame.copy()
+    annotated = frame
 
     if frame_count % PROCESS_EVERY_N_FRAMES != 0:
         active_tracks = person_tracker.update([])
@@ -445,7 +455,7 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         return annotated
 
     # ---- Run boots model with smaller input size ----
-    boots_results = boots_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
+    boots_results = boots_model.predict(frame, imgsz=960,conf=0.01, verbose=False)
     raw_detections = []
 
     for result in boots_results:
@@ -457,7 +467,7 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
             raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
 
     # ---- Run PPE model with smaller input size ----
-    ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
+    ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE,conf=0.35, verbose=False)
 
     for result in ppe_results:
         for box in result.boxes:
@@ -474,6 +484,9 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     # Split into persons vs PPE items
     person_detections = [d for d in raw_detections if d['label'] == "Person"]
     item_detections = [d for d in raw_detections if d['label'] in ITEM_LABELS]
+    print("----------------")
+    for d in item_detections:
+        print(d['label'], d['confidence'])
 
     # De-duplicate overlapping person boxes coming from the two models
     # (keep the highest-confidence box out of any pair that overlaps a lot)
@@ -541,6 +554,69 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     return annotated
 
 
+def camera_worker(config):
+    """
+    Each camera runs independently inside its own thread.
+    """
+
+    global latest_frames
+    global running
+
+    cap, camera_name = open_camera(config)
+
+    if cap is None:
+        print(f"Unable to connect {config['name']}")
+        return
+
+    frame_counter = 0
+
+    tracker = PersonTracker()
+
+    print(f"{camera_name} thread started")
+
+    while running:
+
+        cap.grab()
+        success, frame = cap.read()
+
+        if not success:
+
+            print(f"{camera_name} disconnected")
+
+            cap.release()
+
+            while running:
+
+                print(f"Trying reconnect {camera_name}")
+
+                cap, _ = open_camera(config)
+
+                if cap is not None:
+
+                    print(f"{camera_name} reconnected")
+
+                    break
+
+                time.sleep(5)
+
+            continue
+
+        frame_counter += 1
+
+        processed = process_frame(
+            frame,
+            camera_name,
+            frame_counter,
+            tracker
+        )
+
+        with frame_lock:
+            latest_frames[camera_name] = processed
+
+    cap.release()
+
+    print(f"{camera_name} thread stopped")
+
 def open_camera(config):
     """
     Try each candidate RTSP URL in order until one both opens AND
@@ -569,7 +645,7 @@ def open_camera(config):
             if not cap.isOpened():
                 cap.release()
                 continue
-
+            
             ret, frame = cap.read()
             if ret and frame is not None:
                 _working_rtsp_urls[camera_name] = rtsp_url
@@ -583,57 +659,108 @@ def open_camera(config):
 
 
 def main():
-    caps = []
+
+    global running
+
+    threads = []
+
+    print("Starting Camera Threads...")
+
     for config in CAMERA_CONFIGS:
-        cap, name = open_camera(config)
-        if cap is not None:
-            caps.append((cap, name))
 
-    if not caps:
-        return
+        t = threading.Thread(
+            target=camera_worker,
+            args=(config,),
+            daemon=True
+        )
 
-    print(f"Connected to {len(caps)} camera(s). Press 'q' to quit.")
+        t.start()
 
-    frame_counters = {name: 0 for _, name in caps}
-    person_trackers = {name: PersonTracker() for _, name in caps}
+        threads.append(t)
+
+    print(f"{len(threads)} Camera Thread(s) Started.")
 
     while True:
-        snapshots = []
-        for cap, name in caps:
-            success, frame = cap.read()
-            if success:
-                snapshots.append((name, frame))
-            else:
-                print(f"Failed to read from {name}")
 
-        frames = []
-        for name, frame in snapshots:
-            frame_counters[name] += 1
-            processed_frame = process_frame(
-                frame, name, frame_counters[name], person_trackers[name]
+        with frame_lock:
+            frames = list(latest_frames.values())
+
+        if len(frames) == 0:
+
+            cv2.waitKey(1)
+            continue
+
+        resized = []
+
+        for frame in frames:
+
+            resized.append(
+                cv2.resize(frame, (640,360))
             )
-            frames.append(processed_frame)
 
-        if frames:
-            if len(frames) == 1:
-                display_frame = frames[0]
-            elif len(frames) == 2:
-                frame1 = cv2.resize(frames[0], (640, 360))
-                frame2 = cv2.resize(frames[1], (640, 360))
-                display_frame = cv2.hconcat([frame1, frame2])
-            else:
-                display_frame = cv2.vconcat([cv2.hconcat(frames[i:i + 2]) for i in range(0, len(frames), 2)])
+        if len(resized) == 1:
 
-            cv2.imshow("PPE Detection - Multi-Camera", display_frame)
+            display = resized[0]
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        elif len(resized) == 2:
+
+            display = cv2.hconcat(resized)
+
+        elif len(resized) == 3:
+
+            blank = resized[0].copy()
+            blank[:] = 0
+
+            top = cv2.hconcat(resized[:2])
+            bottom = cv2.hconcat([resized[2], blank])
+
+            display = cv2.vconcat([top,bottom])
+
+        else:
+
+            rows=[]
+
+            for i in range(0,len(resized),2):
+
+                if i+1 < len(resized):
+
+                    row=cv2.hconcat([
+                        resized[i],
+                        resized[i+1]
+                    ])
+
+                else:
+
+                    blank=resized[i].copy()
+                    blank[:]=0
+
+                    row=cv2.hconcat([
+                        resized[i],
+                        blank
+                    ])
+
+                rows.append(row)
+
+            display=cv2.vconcat(rows)
+
+        cv2.imshow(
+            "PPE Detection - Multi Camera",
+            display
+        )
+
+        key=cv2.waitKey(1)
+
+        if key & 0xFF==ord("q"):
+
             break
 
-    for cap, name in caps:
-        cap.release()
-    cv2.destroyAllWindows()
-    alarm.stop()
+    running=False
 
+    time.sleep(1)
+
+    cv2.destroyAllWindows()
+
+    alarm.stop()
 
 if __name__ == "__main__":
     main()
