@@ -1,20 +1,29 @@
 """
-Multi-NVR configuration for UniFi (and other brands).
+Multi-NVR configuration for UniFi Protect (production).
 
-UniFi Protect cameras use token-based RTSP URLs (port 7447), not channel numbers.
-Enable RTSP per camera in Protect: Device → Settings → Advanced → RTSP.
-Copy the token from the generated URL (rtsp://NVR_IP:7447/TOKEN).
+IPs and camera counts:
+  NVR 1  https://10.10.30.2  — 19 cameras
+  NVR 2  https://10.10.30.3  — 20 cameras
+  NVR 3  https://10.10.30.4  — 18 cameras
 
-For each NVR, define cameras explicitly OR use channel_count to auto-number channels 1..N
-(traditional NVR brands). UniFi should use explicit rtsp_token per camera.
+UniFi Protect RTSP is token-based on port 7447.
+Run `python unifi_discover.py` on the site PC to log into each NVR,
+enable RTSP, and write unifi_cameras.json. This module loads that file
+when present; otherwise it builds the expected camera slots from .env.
 """
 
 import os
 from urllib.parse import quote
 
-# Shared credentials (override via environment variables)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from unifi_discover import CACHE_PATH, NVR_HOSTS, load_cache
+
 RAW_USERNAME = os.environ.get("NVR_USERNAME", "admin")
-RAW_PASSWORD = os.environ.get("NVR_PASSWORD", "Eisa@1234")
+RAW_PASSWORD = os.environ.get("NVR_PASSWORD", "")
+RTSP_QUALITY = int(os.environ.get("UNIFI_RTSP_QUALITY", "2"))
 
 USER_ENC = quote(RAW_USERNAME, safe="")
 PASS_ENC = quote(RAW_PASSWORD, safe="")
@@ -39,74 +48,84 @@ def build_hikvision_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=P
     ]
 
 
-def build_unifi_rtsp_urls(ip, rtsp_token, port=7447, stream_quality=0):
+def build_unifi_rtsp_urls(ip, rtsp_token, port=7447, stream_quality=None, camera_ip=None):
     """
-  UniFi Protect RTSP (no username/password — token auth).
-  stream_quality: 0 = high, 1 = medium, 2 = low (appended as _0, _1, _2 if not in token).
+    UniFi Protect RTSP candidates.
+    Token URLs do not use username/password.
+    Direct camera URLs (port 554) use NVR_USERNAME / NVR_PASSWORD as a fallback.
     """
-    token = rtsp_token.strip()
-    if not token.endswith(("_0", "_1", "_2")):
-        token = f"{token}_{stream_quality}"
-    return [f"rtsp://{ip}:{port}/{token}"]
+    if stream_quality is None:
+        stream_quality = RTSP_QUALITY
+
+    urls = []
+    token = (rtsp_token or "").strip()
+    if token:
+        if not token.endswith(("_0", "_1", "_2")):
+            token = f"{token}_{stream_quality}"
+        urls.append(f"rtsp://{ip}:{port}/{token}")
+        # Some Protect versions also accept the alias without a quality suffix
+        base = token.rsplit("_", 1)[0]
+        if base != token:
+            urls.append(f"rtsp://{ip}:{port}/{base}")
+            urls.append(f"rtsp://{ip}:{port}/{base}_0")
+            urls.append(f"rtsp://{ip}:{port}/{base}_1")
+            urls.append(f"rtsp://{ip}:{port}/{base}_2")
+
+    if camera_ip and USER_ENC and PASS_ENC:
+        auth = f"{USER_ENC}:{PASS_ENC}@{camera_ip}:554"
+        urls.extend(
+            [
+                f"rtsp://{auth}/s{stream_quality}",
+                f"rtsp://{auth}/s0",
+                f"rtsp://{auth}/s1",
+                f"rtsp://{auth}/s2",
+                f"rtsp://{auth}/live/ch00_0",
+            ]
+        )
+
+    return urls
 
 
-# ---------------------------------------------------------------------------
-# NVR definitions — edit IPs, tokens, and camera counts for your site
-# ---------------------------------------------------------------------------
-NVR_CONFIGS = [
-    {
-        "id": "nvr1",
-        "name": "UniFi NVR — Site 1",
-        "ip": "192.168.100.9",
+def _placeholder_cameras(count, nvr_name):
+    return [
+        {
+            "name": f"{nvr_name} Cam {i:02d}",
+            "location": f"{nvr_name} — Area {i:02d}",
+            "rtsp_token": "",
+            "camera_ip": "",
+        }
+        for i in range(1, count + 1)
+    ]
+
+
+def _nvr_from_host(host, discovered=None):
+    nvr = {
+        "id": host["id"],
+        "name": host["name"],
+        "ip": host["ip"],
         "brand": "unifi",
         "rtsp_port": 7447,
-        # 10 cameras — replace PLACEHOLDER tokens with values from UniFi Protect UI
-        "cameras": [
-            {"name": "NVR1 Cam 01", "location": "Site 1 — Area 01", "rtsp_token": "PLACEHOLDER_TOKEN_01"},
-            {"name": "NVR1 Cam 02", "location": "Site 1 — Area 02", "rtsp_token": "PLACEHOLDER_TOKEN_02"},
-            {"name": "NVR1 Cam 03", "location": "Site 1 — Area 03", "rtsp_token": "PLACEHOLDER_TOKEN_03"},
-            {"name": "NVR1 Cam 04", "location": "Site 1 — Area 04", "rtsp_token": "PLACEHOLDER_TOKEN_04"},
-            {"name": "NVR1 Cam 05", "location": "Site 1 — Area 05", "rtsp_token": "PLACEHOLDER_TOKEN_05"},
-            {"name": "NVR1 Cam 06", "location": "Site 1 — Area 06", "rtsp_token": "PLACEHOLDER_TOKEN_06"},
-            {"name": "NVR1 Cam 07", "location": "Site 1 — Area 07", "rtsp_token": "PLACEHOLDER_TOKEN_07"},
-            {"name": "NVR1 Cam 08", "location": "Site 1 — Area 08", "rtsp_token": "PLACEHOLDER_TOKEN_08"},
-            {"name": "NVR1 Cam 09", "location": "Site 1 — Area 09", "rtsp_token": "PLACEHOLDER_TOKEN_09"},
-            {"name": "NVR1 Cam 10", "location": "Site 1 — Area 10", "rtsp_token": "PLACEHOLDER_TOKEN_10"},
-        ],
-    },
-    {
-        "id": "nvr2",
-        "name": "UniFi NVR — Site 2",
-        "ip": "192.168.100.10",
-        "brand": "unifi",
-        "rtsp_port": 7447,
-        # 20 cameras
-        "cameras": [
-            {
-                "name": f"NVR2 Cam {i:02d}",
-                "location": f"Site 2 — Area {i:02d}",
-                "rtsp_token": f"PLACEHOLDER_TOKEN_{i:02d}",
-            }
-            for i in range(1, 21)
-        ],
-    },
-    {
-        "id": "nvr3",
-        "name": "UniFi NVR — Site 3",
-        "ip": "192.168.100.11",
-        "brand": "unifi",
-        "rtsp_port": 7447,
-        # 30 cameras
-        "cameras": [
-            {
-                "name": f"NVR3 Cam {i:02d}",
-                "location": f"Site 3 — Area {i:02d}",
-                "rtsp_token": f"PLACEHOLDER_TOKEN_{i:02d}",
-            }
-            for i in range(1, 31)
-        ],
-    },
-]
+    }
+
+    if discovered and discovered.get("cameras"):
+        nvr["cameras"] = discovered["cameras"]
+        return nvr
+
+    nvr["cameras"] = _placeholder_cameras(host["expected_count"], host["name"])
+    return nvr
+
+
+def load_nvr_configs():
+    cache = load_cache(CACHE_PATH)
+    discovered_by_id = {}
+    if cache:
+        for nvr in cache.get("nvrs") or []:
+            discovered_by_id[nvr.get("id")] = nvr
+
+    return [_nvr_from_host(host, discovered_by_id.get(host["id"])) for host in NVR_HOSTS]
+
+
+NVR_CONFIGS = load_nvr_configs()
 
 
 def _rtsp_urls_for_camera(nvr, camera_def, channel_num):
@@ -115,10 +134,12 @@ def _rtsp_urls_for_camera(nvr, camera_def, channel_num):
     port = nvr.get("rtsp_port", 554)
 
     if brand == "unifi":
-        token = camera_def.get("rtsp_token")
-        if not token:
-            raise ValueError(f"UniFi camera on {nvr['id']} needs rtsp_token")
-        return build_unifi_rtsp_urls(ip, token, port=port)
+        return build_unifi_rtsp_urls(
+            ip,
+            camera_def.get("rtsp_token"),
+            port=port,
+            camera_ip=camera_def.get("camera_ip"),
+        )
 
     return build_hikvision_rtsp_urls(ip, port, channel=channel_num)
 
@@ -177,6 +198,7 @@ def build_all_camera_configs(nvr_configs=None):
                     "name": name,
                     "location": location,
                     "ip": nvr_ip,
+                    "camera_ip": cam_def.get("camera_ip", ""),
                     "rtsp_urls": _rtsp_urls_for_camera(nvr, cam_def, channel),
                 }
             )
@@ -209,10 +231,16 @@ def get_nvr_summary(nvr_configs=None):
     ]
 
 
-# Legacy exports used by NVRConnect / live_detection_api
 CAMERA_CONFIGS = build_all_camera_configs()
 NVR_IP = NVR_CONFIGS[0]["ip"] if NVR_CONFIGS else ""
 ACTIVE_CHANNELS = {
     cam["channel"]: {"location": cam["location"], "nvr_id": cam["nvr_id"]}
     for cam in CAMERA_CONFIGS
 }
+
+_cache_note = "loaded from unifi_cameras.json" if load_cache(CACHE_PATH) else "placeholders until unifi_discover.py runs"
+print(
+    f"NVR config: {len(NVR_CONFIGS)} NVR(s), {len(CAMERA_CONFIGS)} camera(s) ({_cache_note})"
+)
+for _nvr in get_nvr_summary():
+    print(f"  {_nvr['id']} {_nvr['ip']}: {_nvr['camera_count']} camera(s)")

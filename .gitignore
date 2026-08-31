@@ -1,4 +1,5 @@
 .env
+unifi_cameras.json
 node_modules/
 __pycache__/
 .venv/

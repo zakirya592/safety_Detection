@@ -54,13 +54,14 @@ def _nvr_camera_endpoint(nvr_id, camera_index):
     return f"/live-detection/{nvr_id}/camera-{camera_index}"
 
 
-def _connect_cameras():
-    caps = []
-    for config in CAMERA_CONFIGS:
-        cap, name = open_camera(config)
-        if cap is not None:
-            caps.append((cap, name, config["id"]))
-    return caps
+def _has_frame(camera_id):
+    return camera_id in _raw_frames or camera_id in _display_frames
+
+
+def _set_raw_frame(camera_id, frame):
+    with _frame_lock:
+        _raw_frames[camera_id] = cv2.resize(frame, (1280, 720))
+        _raw_updated_at[camera_id] = time.time()
 
 
 def _set_display_frame(camera_id, frame):
@@ -77,7 +78,93 @@ def _pick_camera_frame(camera_id):
     if raw is None:
         return display.copy()
 
-    print(f"Live detection stream started with {len(caps)} camera(s) across {len(NVR_CONFIGS)} NVR(s).")
+    display_age = time.time() - _display_updated_at.get(camera_id, 0)
+    if display_age > 1.0:
+        return raw.copy()
+    return display.copy()
+
+
+def _get_stream_frame(camera_id=None):
+    with _frame_lock:
+        camera_ids = sorted(set(_raw_frames) | set(_display_frames))
+        if camera_id is not None:
+            return _pick_camera_frame(camera_id)
+
+        if not camera_ids:
+            return None
+
+        if len(camera_ids) == 1:
+            return _pick_camera_frame(camera_ids[0])
+
+        picked = [_pick_camera_frame(cid) for cid in camera_ids[:2]]
+        if any(frame is None for frame in picked):
+            return None
+
+        f1 = cv2.resize(picked[0], (640, 360))
+        f2 = cv2.resize(picked[1], (640, 360))
+        return cv2.hconcat([f1, f2])
+
+
+def _placeholder_frame(message="Connecting to cameras..."):
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    cv2.putText(
+        frame,
+        message,
+        (40, 360),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (255, 255, 255),
+        2,
+    )
+    return frame
+
+
+def _encode_jpeg_frame(frame):
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        return None
+    return (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+    )
+
+
+def _read_latest_frame(cap):
+    """Read from RTSP and drain the buffer so we always get the newest frame."""
+    success, frame = cap.read()
+    if not success or frame is None:
+        return False, None
+
+    for _ in range(3):
+        grabbed, newer = cap.read()
+        if grabbed and newer is not None:
+            frame = newer
+        else:
+            break
+
+    return True, frame
+
+
+def _capture_loop(cap, name, camera_id):
+    """Fast loop: only grab frames and push them to the live stream."""
+    failures = 0
+    while _stream_running:
+        success, frame = _read_latest_frame(cap)
+        if success:
+            failures = 0
+            _set_raw_frame(camera_id, frame)
+        else:
+            failures += 1
+            print(f"Failed to read from {name} ({failures})")
+            if failures >= 8:
+                return
+            time.sleep(0.25)
+
+
+def _process_loop(name, camera_id):
+    """Slower loop: run PPE detection without blocking the live stream."""
+    frame_counter = 0
+    person_tracker = PersonTracker()
 
     while _stream_running:
         with _frame_lock:
@@ -95,21 +182,26 @@ def _pick_camera_frame(camera_id):
 
 def _start_single_camera(config, camera_id):
     def camera_worker():
-        cap, name = open_camera(config)
-        if cap is None:
-            print(f"Skipping {config['name']} — could not connect.")
-            return
-
         threading.Thread(
             target=_process_loop,
-            args=(name, camera_id),
+            args=(config["name"], camera_id),
             daemon=True,
             name=f"process-{camera_id}",
         ).start()
 
-        print(f"Live stream workers started for {name}.")
-        _capture_loop(cap, name, camera_id)
-        cap.release()
+        while _stream_running:
+            cap, name = open_camera(config)
+            if cap is None:
+                print(f"Could not connect to {config['name']}. Retrying in 10s.")
+                time.sleep(10)
+                continue
+
+            print(f"Live stream workers started for {name}.")
+            _capture_loop(cap, name, camera_id)
+            cap.release()
+            if _stream_running:
+                print(f"Reconnecting {name}...")
+                time.sleep(2)
 
     threading.Thread(
         target=camera_worker,
@@ -127,8 +219,15 @@ def _start_camera_workers():
         "the NVR allows only one RTSP client per channel."
     )
 
-    for i, config in enumerate(CAMERA_CONFIGS, start=1):
-        _start_single_camera(config, i)
+    for config in CAMERA_CONFIGS:
+        if not config.get("rtsp_urls"):
+            print(
+                f"Skipping {config['name']} — no RTSP URL. "
+                "Run python unifi_discover.py on the site PC first."
+            )
+            continue
+        _start_single_camera(config, config["id"])
+        time.sleep(0.25)
 
 
 def _generate_mjpeg(camera_id=None):
@@ -163,7 +262,7 @@ def _camera_public(cam, has_frame=False):
         "nvr_ip": cam["nvr_ip"],
         "camera_index": cam["camera_index"],
         "channel": cam.get("channel"),
-        "has_frame": has_frame or cam["id"] in _latest_frames,
+        "has_frame": has_frame or _has_frame(cam["id"]),
         "endpoint": _camera_endpoint(cam["id"]),
         "nvr_endpoint": _nvr_camera_endpoint(cam["nvr_id"], cam["camera_index"]),
     }
@@ -174,10 +273,13 @@ def index():
     nvr_sections = []
     for nvr in get_nvr_summary():
         camera_blocks = "".join(
-            f"<div><h4>{cam['name']}</h4>"
-            f"<p style='margin:0 0 8px;color:#aaa'>{cam.get('location', 'Unknown')}</p>"
-            f"<img src='{_camera_endpoint(cam['id'])}' "
-            f"style='width:100%;max-width:480px;display:block'/></div>"
+            f"<div style='min-width:220px'>"
+            f"<h4 style='margin:0 0 4px'>{cam['name']}</h4>"
+            f"<p style='margin:0 0 8px;color:#aaa;font-size:13px'>"
+            f"{cam.get('location', 'Unknown')}</p>"
+            f"<a href='{_camera_endpoint(cam['id'])}' "
+            f"style='color:#7ec8ff'>Open stream</a>"
+            f"</div>"
             for cam in nvr["cameras"]
         )
         nvr_sections.append(
@@ -191,6 +293,8 @@ def index():
         "<html><body style='margin:0;background:#111;color:#fff;font-family:sans-serif'>"
         f"<h2 style='padding:16px'>PPE Live Detection — {len(NVR_CONFIGS)} NVR(s), "
         f"{len(CAMERA_CONFIGS)} camera(s)</h2>"
+        "<p style='padding:0 16px;color:#aaa'>Open a camera stream individually "
+        "(loading all 57 MJPEG feeds in one page would freeze the browser).</p>"
         "<div style='padding:16px'>"
         f"{''.join(nvr_sections)}"
         "</div></body></html>"
@@ -225,6 +329,7 @@ def live_detection_nvr_camera(nvr_id, camera_index):
     return Response(
         _generate_mjpeg(camera_id=camera_id),
         mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers=MJPEG_HEADERS,
     )
 
 
@@ -242,9 +347,7 @@ def api_nvrs():
                     "brand": nvr["brand"],
                     "rtsp_port": nvr["rtsp_port"],
                     "camera_count": nvr["camera_count"],
-                    "cameras": [
-                        _camera_public(cam) for cam in nvr["cameras"]
-                    ],
+                    "cameras": [_camera_public(cam) for cam in nvr["cameras"]],
                 }
                 for nvr in nvrs
             ],
@@ -288,7 +391,7 @@ def health():
         "stream_running": _stream_running,
         "nvr_count": len(NVR_CONFIGS),
         "camera_count": len(CAMERA_CONFIGS),
-        "connected_frames": len(_latest_frames),
+        "connected_frames": len(set(_raw_frames) | set(_display_frames)),
         "nvrs": [
             {
                 "id": nvr["id"],

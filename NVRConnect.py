@@ -14,6 +14,7 @@ os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 RTSP_OPEN_TIMEOUT_MS = 5000
 _working_rtsp_urls = {}
 _open_camera_lock = threading.Lock()
+_inference_lock = threading.Lock()
 
 # Initialize screenshot manager with 30-second reset time
 screenshot_manager = ScreenshotManager(reset_time_seconds=30)
@@ -230,7 +231,8 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         return annotated
 
     # ---- Run boots model with smaller input size ----
-    boots_results = boots_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
+    with _inference_lock:
+        boots_results = boots_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
     boots_detections = []
 
     for result in boots_results:
@@ -319,7 +321,8 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
                     0.6, color, 2)
 
     # ---- Run PPE model with smaller input size ----
-    ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
+    with _inference_lock:
+        ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
     ppe_detections = []
 
     for result in ppe_results:
@@ -456,14 +459,27 @@ def open_camera(config):
     camera_name = config["name"]
     print(f"Connecting to {camera_name} at {config['ip']}...")
 
-    rtsp_urls = list(config["rtsp_urls"])
+    rtsp_urls = list(config.get("rtsp_urls") or [])
+    if not rtsp_urls:
+        print(
+            f"  No RTSP URL for {camera_name}. "
+            "Run python unifi_discover.py on the site PC first."
+        )
+        return None, None
     cached_url = _working_rtsp_urls.get(camera_name)
     if cached_url:
         rtsp_urls = [cached_url] + [url for url in rtsp_urls if url != cached_url]
 
     with _open_camera_lock:
         for rtsp_url in rtsp_urls:
-            safe_log_url = rtsp_url.replace(PASS_ENC, "****")
+            safe_log_url = rtsp_url.replace(PASS_ENC, "****") if PASS_ENC else rtsp_url
+            if "://" in safe_log_url:
+                scheme, rest = safe_log_url.split("://", 1)
+                host_and_path = rest.split("@")[-1] if "@" in rest else rest
+                path = host_and_path.split("/", 1)[1] if "/" in host_and_path else ""
+                if path and "PLACEHOLDER" not in path:
+                    host = host_and_path.split("/", 1)[0]
+                    safe_log_url = f"{scheme}://{host}/***"
             print(f"  Trying: {safe_log_url}")
 
             cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
