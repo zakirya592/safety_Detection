@@ -1,10 +1,14 @@
+import os
+import threading
+
 import cv2
+import numpy as np
 from ultralytics import YOLO
+
 from alarm import Alarm
 from screenshot import ScreenshotManager
 from detection_alert_db import save_detection_alerts_async
-import os
-import threading
+from unifi_discover import fetch_snapshot_jpeg
 
 # Initialize alarm
 alarm = Alarm()
@@ -451,21 +455,60 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     return annotated
 
 
+class ProtectSnapshotCapture:
+    """OpenCV-like capture that pulls JPEG snapshots from UniFi Protect."""
+
+    is_snapshot = True
+
+    def __init__(self, nvr_ip, protect_id, name):
+        self.nvr_ip = nvr_ip
+        self.protect_id = protect_id
+        self.name = name
+        self._opened = True
+
+    def isOpened(self):
+        return self._opened
+
+    def read(self):
+        jpeg = fetch_snapshot_jpeg(self.nvr_ip, self.protect_id)
+        if not jpeg:
+            return False, None
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return False, None
+        return True, frame
+
+    def set(self, *_args, **_kwargs):
+        return False
+
+    def release(self):
+        self._opened = False
+
+
+def _open_protect_snapshot(config):
+    protect_id = config.get("protect_id")
+    nvr_ip = config.get("nvr_ip") or config.get("ip")
+    if not protect_id or not nvr_ip:
+        return None, None
+    cap = ProtectSnapshotCapture(nvr_ip, protect_id, config["name"])
+    ok, frame = cap.read()
+    if ok and frame is not None:
+        print(f"  Connected using Protect snapshot ({nvr_ip})")
+        return cap, config["name"]
+    cap.release()
+    return None, None
+
+
 def open_camera(config):
     """
     Try each candidate RTSP URL in order until one both opens AND
-    successfully returns a frame. Returns (cap, name) or (None, None).
+    successfully returns a frame. Falls back to Protect snapshots.
+    Returns (cap, name) or (None, None).
     """
     camera_name = config["name"]
     print(f"Connecting to {camera_name} at {config['ip']}...")
 
     rtsp_urls = list(config.get("rtsp_urls") or [])
-    if not rtsp_urls:
-        print(
-            f"  No RTSP URL for {camera_name}. "
-            "Run python unifi_discover.py on the site PC first."
-        )
-        return None, None
     cached_url = _working_rtsp_urls.get(camera_name)
     if cached_url:
         rtsp_urls = [cached_url] + [url for url in rtsp_urls if url != cached_url]
@@ -501,7 +544,12 @@ def open_camera(config):
 
             cap.release()
 
-    print(f"Failed to connect to {camera_name} after trying all URL formats")
+    print(f"  RTSP did not work for {camera_name}; trying Protect snapshot...")
+    cap, name = _open_protect_snapshot(config)
+    if cap is not None:
+        return cap, name
+
+    print(f"Failed to connect to {camera_name} after RTSP and snapshot")
     return None, None
 
 

@@ -199,6 +199,9 @@ def build_all_camera_configs(nvr_configs=None):
                     "location": location,
                     "ip": nvr_ip,
                     "camera_ip": cam_def.get("camera_ip", ""),
+                    "protect_id": cam_def.get("protect_id"),
+                    "stream": cam_def.get("stream", "rtsp"),
+                    "online": cam_def.get("online", True),
                     "rtsp_urls": _rtsp_urls_for_camera(nvr, cam_def, channel),
                 }
             )

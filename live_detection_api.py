@@ -131,6 +131,9 @@ def _encode_jpeg_frame(frame):
 
 def _read_latest_frame(cap):
     """Read from RTSP and drain the buffer so we always get the newest frame."""
+    if getattr(cap, "is_snapshot", False):
+        return cap.read()
+
     success, frame = cap.read()
     if not success or frame is None:
         return False, None
@@ -220,9 +223,9 @@ def _start_camera_workers():
     )
 
     for config in CAMERA_CONFIGS:
-        if not config.get("rtsp_urls"):
+        if not config.get("rtsp_urls") and not config.get("protect_id"):
             print(
-                f"Skipping {config['name']} — no RTSP URL. "
+                f"Skipping {config['name']} — no RTSP URL or Protect id. "
                 "Run python unifi_discover.py on the site PC first."
             )
             continue
