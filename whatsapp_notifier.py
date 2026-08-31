@@ -221,17 +221,25 @@ class WhatsAppNotifier:
             else reuse_tab_env in {"1", "true", "yes"}
         )
 
+        alerts_enabled = os.environ.get("WHATSAPP_ALERTS_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
         if self.provider == "twilio":
-            self.enabled = bool(
+            configured = bool(
                 self.account_sid and self.auth_token and self.whatsapp_from and self.whatsapp_to
             )
         elif self.provider == "callmebot":
-            self.enabled = bool(self.callmebot_phone and self.callmebot_api_key)
+            configured = bool(self.callmebot_phone and self.callmebot_api_key)
         elif self.provider == "pywhatkit":
-            self.enabled = bool(self.pywhatkit_phone)
+            configured = bool(self.pywhatkit_phone)
         else:
             self.provider = "pywhatkit"
-            self.enabled = bool(self.pywhatkit_phone)
+            configured = bool(self.pywhatkit_phone)
+
+        self.enabled = configured and alerts_enabled
 
         if self.enabled:
             logger.info(
@@ -240,6 +248,8 @@ class WhatsAppNotifier:
                 self.pywhatkit_reuse_tab,
                 self.pywhatkit_wait_time,
             )
+        elif configured and not alerts_enabled:
+            logger.info("WhatsApp notifier paused (WHATSAPP_ALERTS_ENABLED=false)")
         else:
             logger.warning(
                 "WhatsApp notifier disabled. For PyWhatKit set PYWHATKIT_PHONE. "

@@ -35,10 +35,18 @@ class EmailNotifier:
         self.smtp_from = (smtp_from or os.environ.get("SMTP_FROM") or self.smtp_user).strip()
         recipients = alert_to or os.environ.get("ALERT_EMAIL_TO", "")
         self.alert_to = [email.strip() for email in recipients.split(",") if email.strip()]
-        self.enabled = bool(self.smtp_user and self.smtp_password and self.alert_to)
+        alerts_enabled = os.environ.get("EMAIL_ALERTS_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        configured = bool(self.smtp_user and self.smtp_password and self.alert_to)
+        self.enabled = configured and alerts_enabled
 
         if self.enabled:
             logger.info("Email notifier enabled (%d recipient(s))", len(self.alert_to))
+        elif configured and not alerts_enabled:
+            logger.info("Email notifier paused (EMAIL_ALERTS_ENABLED=false)")
         else:
             logger.warning(
                 "Email notifier disabled. Set SMTP_USER, SMTP_PASSWORD, and ALERT_EMAIL_TO."
