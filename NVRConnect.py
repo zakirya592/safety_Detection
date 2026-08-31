@@ -1,5 +1,4 @@
 import cv2
-from urllib.parse import quote
 from ultralytics import YOLO
 from alarm import Alarm
 from screenshot import ScreenshotManager
@@ -188,73 +187,20 @@ class PersonTracker:
 
 
 # ---------------------------------------------------------------------------
-# Camera / NVR configuration
+# Camera / NVR configuration (multi-NVR — see nvr_config.py)
 # ---------------------------------------------------------------------------
-# IMPORTANT: build RTSP URLs with urllib.parse.quote so special characters
-# in the username/password (like "@") are always encoded correctly and
-# consistently. Hand-typing "%40" in a string is error-prone and, if you
-# accidentally also include the raw "@" version, that raw version is
-# actually an invalid URL (two "@" symbols confuses the parser: it splits
-# on the LAST "@", so the password and part of the host get merged into
-# garbage). Never include the un-encoded form as a fallback.
-
-RAW_USERNAME = "admin"
-RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.100.218"
-RTSP_PORT = 554
-
-USER_ENC = quote(RAW_USERNAME, safe="")
-PASS_ENC = quote(RAW_PASSWORD, safe="")
-
-
-def build_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
-    """
-    Build a list of RTSP URL candidates covering the common NVR/camera
-    brand conventions (Hikvision-style, Dahua-style, Uniview-style).
-    All candidates use properly percent-encoded credentials.
-    """
-    auth = f"{user_enc}:{pass_enc}@{ip}:{port}"
-    hik_channel = f"{channel}01"  # e.g. channel 1 -> 101, channel 2 -> 201
-
-    return [
-        # Uniview-style (IPC2122LB cameras / Uniview NVR — try first)
-        f"rtsp://{auth}/unicast/c{channel}/s0/live",
-        f"rtsp://{auth}/unicast/c{channel}/s1/live",
-        f"rtsp://{auth}/media/video{channel}",
-
-        # Hikvision-style
-        f"rtsp://{auth}/Streaming/Channels/{hik_channel}",
-        f"rtsp://{auth}/Streaming/Channels/{hik_channel}/main",
-        f"rtsp://{auth}/Streaming/Channels/{channel}02",  # sub stream
-
-        # Dahua-style
-        f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=0",
-        f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=1",
-
-        # Generic fallbacks
-        f"rtsp://{auth}/channel{channel}",
-        f"rtsp://{auth}/stream{channel}",
-    ]
-
-
-
-# List every channel number the NVR has a camera attached to (from your
-# NVR's Camera Management list this was D1 and D2, i.e. channels 1 and 2).
-# Add more numbers here if you connect additional cameras later.
-ACTIVE_CHANNELS = {
-    1: {'location': 'Production Line'},
-    2: {'location': 'Warehouse Entrance'},
-}
-
-CAMERA_CONFIGS = [
-    {
-        'name': f'NVR Channel {channel}',
-        'location': info.get('location', 'Unknown'),
-        'rtsp_urls': build_rtsp_urls(NVR_IP, RTSP_PORT, channel=channel),
-        'ip': NVR_IP
-    }
-    for channel, info in ACTIVE_CHANNELS.items()
-]
+from nvr_config import (
+    ACTIVE_CHANNELS,
+    CAMERA_CONFIGS,
+    NVR_CONFIGS,
+    NVR_IP,
+    PASS_ENC,
+    RAW_PASSWORD,
+    RAW_USERNAME,
+    build_hikvision_rtsp_urls as build_rtsp_urls,
+    build_unifi_rtsp_urls,
+    get_nvr_summary,
+)
 
 CAMERA_LOCATIONS = {config["name"]: config.get("location", "Unknown") for config in CAMERA_CONFIGS}
 
