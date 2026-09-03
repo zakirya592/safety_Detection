@@ -495,20 +495,26 @@ def discover_all(enable_rtsp_streams=True):
     print(f"  Snapshot fallback: {total - rtsp_ok}")
     if errors:
         print(f"{len(errors)} NVR(s) failed — run this script on the site PC that can reach 10.10.30.x")
-    return nvrs, errors
+    return nvrs, errors, total, rtsp_ok
 
 
 def main():
     try:
-        nvrs, errors = discover_all(enable_rtsp_streams=True)
+        nvrs, errors, total, rtsp_ok = discover_all(enable_rtsp_streams=True)
     except Exception as exc:
         print(f"Discovery failed: {exc}", file=sys.stderr)
         return 1
 
     print("\nWhat this means:")
     print("  Login to Protect succeeded.")
-    print("  HTTP 403 on RTSP means this user can view cameras but cannot turn RTSP on.")
-    print("  Detection can still run using Protect snapshots (no RTSP token needed).")
+    if rtsp_ok:
+        print(f"  RTSP is ready for {rtsp_ok} camera(s).")
+    if total - rtsp_ok > 0:
+        print(
+            f"  {total - rtsp_ok} camera(s) have no RTSP token — "
+            "those will use Protect snapshots."
+        )
+        print("  HTTP 403 would mean this user cannot turn RTSP on in Protect.")
     print("\nNext:")
     print("  python live_detection_api.py")
     return 1 if errors else 0

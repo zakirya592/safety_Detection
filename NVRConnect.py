@@ -12,12 +12,12 @@ from unifi_discover import fetch_snapshot_jpeg
 
 # Initialize alarm
 alarm = Alarm()
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;2500000"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 
-RTSP_OPEN_TIMEOUT_MS = 5000
+RTSP_OPEN_TIMEOUT_MS = 2500
 _working_rtsp_urls = {}
-_open_camera_lock = threading.Lock()
+_open_camera_sema = threading.Semaphore(4)
 _inference_lock = threading.Lock()
 
 # Initialize screenshot manager with 30-second reset time
@@ -499,21 +499,33 @@ def _open_protect_snapshot(config):
     return None, None
 
 
+def _camera_key(config):
+    return config.get("protect_id") or config.get("id") or config["name"]
+
+
 def open_camera(config):
     """
-    Try each candidate RTSP URL in order until one both opens AND
-    successfully returns a frame. Falls back to Protect snapshots.
-    Returns (cap, name) or (None, None).
+    Try a short list of UniFi RTSP URLs, then Protect snapshots.
+    Connections run in parallel (up to 4) so NVR 2/3 are not stuck
+    behind NVR 1.
     """
     camera_name = config["name"]
     print(f"Connecting to {camera_name} at {config['ip']}...")
 
-    rtsp_urls = list(config.get("rtsp_urls") or [])
-    cached_url = _working_rtsp_urls.get(camera_name)
+    if config.get("online") is False:
+        print(f"  {camera_name} is offline in Protect — using snapshot if available")
+        cap, name = _open_protect_snapshot(config)
+        if cap is not None:
+            return cap, name
+        return None, None
+
+    cache_key = _camera_key(config)
+    rtsp_urls = list(config.get("rtsp_urls") or [])[:2]
+    cached_url = _working_rtsp_urls.get(cache_key)
     if cached_url:
         rtsp_urls = [cached_url] + [url for url in rtsp_urls if url != cached_url]
 
-    with _open_camera_lock:
+    with _open_camera_sema:
         for rtsp_url in rtsp_urls:
             safe_log_url = rtsp_url.replace(PASS_ENC, "****") if PASS_ENC else rtsp_url
             if "://" in safe_log_url:
@@ -538,7 +550,7 @@ def open_camera(config):
 
             ret, frame = cap.read()
             if ret and frame is not None:
-                _working_rtsp_urls[camera_name] = rtsp_url
+                _working_rtsp_urls[cache_key] = rtsp_url
                 print(f"  Connected using: {safe_log_url}")
                 return cap, camera_name
 

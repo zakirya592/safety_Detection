@@ -50,40 +50,54 @@ def build_hikvision_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=P
 
 def build_unifi_rtsp_urls(ip, rtsp_token, port=7447, stream_quality=None, camera_ip=None):
     """
-    UniFi Protect RTSP candidates.
-    Token URLs do not use username/password.
-    Direct camera URLs (port 554) use NVR_USERNAME / NVR_PASSWORD as a fallback.
+    UniFi Protect RTSP on port 7447. Only try the quality suffix we want,
+    then high quality. Extra camera-IP URLs are skipped — they hang for
+    5–30s each and blocked NVR 2/3 from connecting.
     """
     if stream_quality is None:
         stream_quality = RTSP_QUALITY
 
-    urls = []
     token = (rtsp_token or "").strip()
-    if token:
-        if not token.endswith(("_0", "_1", "_2")):
-            token = f"{token}_{stream_quality}"
-        urls.append(f"rtsp://{ip}:{port}/{token}")
-        # Some Protect versions also accept the alias without a quality suffix
-        base = token.rsplit("_", 1)[0]
-        if base != token:
-            urls.append(f"rtsp://{ip}:{port}/{base}")
-            urls.append(f"rtsp://{ip}:{port}/{base}_0")
-            urls.append(f"rtsp://{ip}:{port}/{base}_1")
-            urls.append(f"rtsp://{ip}:{port}/{base}_2")
+    if not token:
+        return []
 
-    if camera_ip and USER_ENC and PASS_ENC:
-        auth = f"{USER_ENC}:{PASS_ENC}@{camera_ip}:554"
-        urls.extend(
-            [
-                f"rtsp://{auth}/s{stream_quality}",
-                f"rtsp://{auth}/s0",
-                f"rtsp://{auth}/s1",
-                f"rtsp://{auth}/s2",
-                f"rtsp://{auth}/live/ch00_0",
-            ]
-        )
+    base = token[:-2] if token.endswith(("_0", "_1", "_2")) else token
+    urls = [
+        f"rtsp://{ip}:{port}/{base}_{stream_quality}",
+        f"rtsp://{ip}:{port}/{base}_0",
+    ]
+    seen = []
+    for url in urls:
+        if url not in seen:
+            seen.append(url)
+    return seen
 
-    return urls
+
+def _unique_camera_name(name, cam_def, idx, used_names):
+    base = (name or f"Camera {idx}").strip() or f"Camera {idx}"
+    mac = (cam_def.get("mac") or "").replace(":", "").replace("-", "")[-6:]
+    token = (cam_def.get("rtsp_token") or "")[-4:]
+    suffix = mac or token or f"{idx:02d}"
+    generic = base.lower() in {
+        "g6 bullet",
+        "g5 bullet",
+        "g4 bullet",
+        "g4 dome",
+        "g5 dome",
+        "g5 ptz",
+        "ai 360",
+        "camera",
+    }
+    candidate = f"{base} {suffix}" if generic else base
+    if candidate in used_names:
+        candidate = f"{base} {suffix}"
+    n = 2
+    original = candidate
+    while candidate in used_names:
+        candidate = f"{original} ({n})"
+        n += 1
+    used_names.add(candidate)
+    return candidate
 
 
 def _placeholder_cameras(count, nvr_name):
@@ -151,6 +165,7 @@ def build_all_camera_configs(nvr_configs=None):
 
     cameras = []
     global_id = 1
+    used_names = set()
 
     for nvr in nvr_configs:
         nvr_id = nvr["id"]
@@ -183,7 +198,12 @@ def build_all_camera_configs(nvr_configs=None):
 
         for idx, cam_def in enumerate(camera_list, start=1):
             channel = cam_def.get("channel", idx)
-            name = cam_def.get("name", f"{nvr_name} Cam {idx}")
+            name = _unique_camera_name(
+                cam_def.get("name", f"{nvr_name} Cam {idx}"),
+                cam_def,
+                idx,
+                used_names,
+            )
             location = cam_def.get("location", "Unknown")
 
             cameras.append(

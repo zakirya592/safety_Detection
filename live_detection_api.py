@@ -18,7 +18,7 @@ from NVRConnect import (
 from detection_alert_db import get_all_alerts
 from notification_logging import setup_notification_logging
 
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;2500000"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 
 app = Flask(__name__)
@@ -218,10 +218,11 @@ def _start_camera_workers():
 
     _stream_running = True
     print(
-        "Starting camera workers. Close NVRConnect.py first — "
-        "the NVR allows only one RTSP client per channel."
+        "Starting camera workers across all NVRs in parallel. "
+        "Close NVRConnect.py first — each RTSP channel allows one client."
     )
 
+    by_nvr = {}
     for config in CAMERA_CONFIGS:
         if not config.get("rtsp_urls") and not config.get("protect_id"):
             print(
@@ -229,8 +230,22 @@ def _start_camera_workers():
                 "Run python unifi_discover.py on the site PC first."
             )
             continue
-        _start_single_camera(config, config["id"])
-        time.sleep(0.25)
+        by_nvr.setdefault(config["nvr_id"], []).append(config)
+
+    nvr_lists = list(by_nvr.values())
+    started = 0
+    while nvr_lists:
+        still_pending = []
+        for cameras in nvr_lists:
+            config = cameras.pop(0)
+            _start_single_camera(config, config["id"])
+            started += 1
+            time.sleep(0.05)
+            if cameras:
+                still_pending.append(cameras)
+        nvr_lists = still_pending
+
+    print(f"Started {started} camera worker(s).")
 
 
 def _generate_mjpeg(camera_id=None):
@@ -266,6 +281,8 @@ def _camera_public(cam, has_frame=False):
         "camera_index": cam["camera_index"],
         "channel": cam.get("channel"),
         "has_frame": has_frame or _has_frame(cam["id"]),
+        "online": cam.get("online", True),
+        "stream": cam.get("stream", "rtsp"),
         "endpoint": _camera_endpoint(cam["id"]),
         "nvr_endpoint": _nvr_camera_endpoint(cam["nvr_id"], cam["camera_index"]),
     }
@@ -389,22 +406,27 @@ def api_cameras():
 
 @app.route("/health")
 def health():
-    return {
-        "status": "ok",
-        "stream_running": _stream_running,
-        "nvr_count": len(NVR_CONFIGS),
-        "camera_count": len(CAMERA_CONFIGS),
-        "connected_frames": len(set(_raw_frames) | set(_display_frames)),
-        "nvrs": [
+    connected_ids = set(_raw_frames) | set(_display_frames)
+    nvrs = []
+    for nvr in NVR_CONFIGS:
+        cams = [c for c in CAMERA_CONFIGS if c["nvr_id"] == nvr["id"]]
+        nvrs.append(
             {
                 "id": nvr["id"],
                 "name": nvr["name"],
                 "ip": nvr["ip"],
                 "brand": nvr.get("brand"),
-                "camera_count": sum(1 for c in CAMERA_CONFIGS if c["nvr_id"] == nvr["id"]),
+                "camera_count": len(cams),
+                "connected": sum(1 for c in cams if c["id"] in connected_ids),
             }
-            for nvr in NVR_CONFIGS
-        ],
+        )
+    return {
+        "status": "ok",
+        "stream_running": _stream_running,
+        "nvr_count": len(NVR_CONFIGS),
+        "camera_count": len(CAMERA_CONFIGS),
+        "connected_frames": len(connected_ids),
+        "nvrs": nvrs,
         "cameras": {
             f"camera_{cam['id']}": _camera_public(cam) for cam in CAMERA_CONFIGS
         },
