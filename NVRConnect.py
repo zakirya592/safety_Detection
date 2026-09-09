@@ -1,6 +1,5 @@
 import os
 import threading
-from dotenv import load_dotenv
 import time
 
 import cv2
@@ -340,72 +339,20 @@ class PersonTracker:
 
 
 # ---------------------------------------------------------------------------
-# Camera / NVR configuration (multi-NVR — see nvr_config.py)
+# Camera / NVR configuration (three UniFi NVRs from .env / unifi_cameras.json)
 # ---------------------------------------------------------------------------
-# IMPORTANT: build RTSP URLs with urllib.parse.quote so special characters
-# in the username/password (like "@") are always encoded correctly and
-# consistently. Hand-typing "%40" in a string is error-prone and, if you
-# accidentally also include the raw "@" version, that raw version is
-# actually an invalid URL (two "@" symbols confuses the parser: it splits
-# on the LAST "@", so the password and part of the host get merged into
-# garbage). Never include the un-encoded form as a fallback.
-
-RAW_USERNAME = os.environ.get("NVR_USER_NAME")
-RAW_PASSWORD = os.environ.get("RAW_PASSWORD")
-NVR_IP = os.environ.get("NVR_IP")
-RTSP_PORT = os.environ.get("RTSP_PORT")
-
-USER_ENC = quote(RAW_USERNAME, safe="")
-PASS_ENC = quote(RAW_PASSWORD, safe="")
-
-
-def build_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
-    """
-    Build a list of RTSP URL candidates covering the common NVR/camera
-    brand conventions (Hikvision-style, Dahua-style, Uniview-style).
-    All candidates use properly percent-encoded credentials.
-    """
-    auth = f"{user_enc}:{pass_enc}@{ip}:{port}"
-    hik_channel = f"{channel}01"  # e.g. channel 1 -> 101, channel 2 -> 201
-
-    return [
-        # Uniview-style (IPC2122LB cameras / Uniview NVR — try first)
-        f"rtsp://{auth}/unicast/c{channel}/s0/live",
-        f"rtsp://{auth}/unicast/c{channel}/s1/live",
-        f"rtsp://{auth}/media/video{channel}",
-
-        # Hikvision-style
-        f"rtsp://{auth}/Streaming/Channels/{hik_channel}",
-        f"rtsp://{auth}/Streaming/Channels/{hik_channel}/main",
-        f"rtsp://{auth}/Streaming/Channels/{channel}02",  # sub stream
-
-        # Dahua-style
-        f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=0",
-        f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=1",
-
-        # Generic fallbacks
-        f"rtsp://{auth}/channel{channel}",
-        f"rtsp://{auth}/stream{channel}",
-    ]
-
-
-# List every channel number the NVR has a camera attached to (from your
-# NVR's Camera Management list this was D1 and D2, i.e. channels 1 and 2).
-# Add more numbers here if you connect additional cameras later.
-ACTIVE_CHANNELS = {
-    1: {'location': 'Production Line'},
-    2: {'location': 'Warehouse Entrance'},
-}
-
-CAMERA_CONFIGS = [
-    {
-        'name': f'NVR Channel {channel}',
-        'location': info.get('location', 'Unknown'),
-        'rtsp_urls': build_rtsp_urls(NVR_IP, RTSP_PORT, channel=channel),
-        'ip': NVR_IP
-    }
-    for channel, info in ACTIVE_CHANNELS.items()
-]
+from nvr_config import (
+    ACTIVE_CHANNELS,
+    CAMERA_CONFIGS,
+    NVR_CONFIGS,
+    NVR_IP,
+    PASS_ENC,
+    RAW_PASSWORD,
+    RAW_USERNAME,
+    build_hikvision_rtsp_urls as build_rtsp_urls,
+    build_unifi_rtsp_urls,
+    get_nvr_summary,
+)
 
 CAMERA_LOCATIONS = {config["name"]: config.get("location", "Unknown") for config in CAMERA_CONFIGS}
 
@@ -624,6 +571,55 @@ def camera_worker(config):
     cap.release()
 
     print(f"{camera_name} thread stopped")
+
+
+class ProtectSnapshotCapture:
+    """OpenCV-like capture that pulls JPEG snapshots from UniFi Protect."""
+
+    is_snapshot = True
+
+    def __init__(self, nvr_ip, protect_id, name):
+        self.nvr_ip = nvr_ip
+        self.protect_id = protect_id
+        self.name = name
+        self._opened = True
+
+    def isOpened(self):
+        return self._opened
+
+    def read(self):
+        jpeg = fetch_snapshot_jpeg(self.nvr_ip, self.protect_id)
+        if not jpeg:
+            return False, None
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return False, None
+        return True, frame
+
+    def set(self, *_args, **_kwargs):
+        return False
+
+    def release(self):
+        self._opened = False
+
+
+def _open_protect_snapshot(config):
+    protect_id = config.get("protect_id")
+    nvr_ip = config.get("nvr_ip") or config.get("ip")
+    if not protect_id or not nvr_ip:
+        return None, None
+    cap = ProtectSnapshotCapture(nvr_ip, protect_id, config["name"])
+    ok, frame = cap.read()
+    if ok and frame is not None:
+        print(f"  Connected using Protect snapshot ({nvr_ip})")
+        return cap, config["name"]
+    cap.release()
+    return None, None
+
+
+def _camera_key(config):
+    return config.get("protect_id") or config.get("id") or config["name"]
+
 
 def open_camera(config):
     """
