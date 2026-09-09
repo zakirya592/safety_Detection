@@ -1,5 +1,7 @@
 import os
 import threading
+from dotenv import load_dotenv
+import time
 
 import cv2
 import numpy as np
@@ -12,7 +14,7 @@ from unifi_discover import fetch_snapshot_jpeg
 
 # Initialize alarm
 alarm = Alarm()
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;2500000"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
 
 RTSP_OPEN_TIMEOUT_MS = 2500
@@ -20,26 +22,32 @@ _working_rtsp_urls = {}
 _open_camera_sema = threading.Semaphore(4)
 _inference_lock = threading.Lock()
 
+# ===========================================
+# Parallel Camera Processing
+# ===========================================
+
+latest_frames = {}
+frame_lock = threading.Lock()
+
+running = True
+
 # Initialize screenshot manager with 30-second reset time
-screenshot_manager = ScreenshotManager(reset_time_seconds=30)
+screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 
 # Load both YOLO models
-boots_model = YOLO("best11.pt")
+boots_model = YOLO("bestsss.pt")
 ppe_model = YOLO("best.pt")
 
 # Class mapping for the boots model
 BOOTS_CLASSES = {
-    0: "helmet",
-    1: "gloves",
-    2: "vest",
-    3: "boots",
-    4: "goggles",
-    5: "none",
-    6: "Person",
-    7: "no_helmet",
-    8: "no_goggle",
-    9: "no_gloves",
-    10: "no_boots"
+    0: "glove",
+    1: "goggles",
+    2: "helmet",
+    3: "mask",
+    4: "no_glove",
+    5: "no_goggles",
+    6: "no_helmet",
+    7: "no_mask",
 }
 
 # Class mapping for the PPE model
@@ -56,24 +64,44 @@ PPE_CLASSES = {
     9: "Vehicle"
 }
 
-# Show boots, goggles, and Person from boots model
-BOOTS_SHOW_LABELS = {"boots", "no_boots", "goggles", "no_goggle", "Person"}
-BOOTS_VIOLATION_LABELS = {"no_boots", "no_goggle"}
+# ---------------------------------------------------------------------------
+# PPE item classes we care about for the person-level compliance decision.
+# "positive" = the item IS being worn. "negative" = the model explicitly says
+# it is NOT being worn. Anything not seen at all for a person is left as
+# "unknown" rather than assumed compliant or a violation.
+# ---------------------------------------------------------------------------
+HELMET_POSITIVE = {"Hardhat"}
+HELMET_NEGATIVE = {"NO-Hardhat"}
+VEST_POSITIVE = {"Safety Vest"}
+VEST_NEGATIVE = {"NO-Safety Vest"}
+GLOVE_POSITIVE = {"glove"}
+GLOVE_NEGATIVE = {"no_glove"}
 
-# Only these get drawn from the PPE model
-PPE_SHOW_LABELS = {"Hardhat", "NO-Hardhat", "Safety Vest", "NO-Safety Vest", "Person"}
-PPE_VIOLATION_LABELS = {"NO-Hardhat", "NO-Safety Vest"}
+GOGGLES_POSITIVE = {"goggles"}
+GOGGLES_NEGATIVE = {"no_goggles"}
+
+# All the item labels we bother drawing/considering (Person is handled separately)
+ITEM_LABELS = HELMET_POSITIVE | HELMET_NEGATIVE | VEST_POSITIVE | VEST_NEGATIVE | GLOVE_POSITIVE | GLOVE_NEGATIVE | GOGGLES_POSITIVE | GOGGLES_NEGATIVE
+
 
 # Confidence threshold for Person class only (lowered to 30% to detect more people)
 PERSON_CONFIDENCE_THRESHOLD = 0.30
 
+# Fraction of an item's own box area that must fall inside a person's box
+# for that item to be considered "worn by" that person.
+ITEM_CONTAINMENT_THRESHOLD = 0.5
+
 # Performance optimization settings
-PROCESS_EVERY_N_FRAMES = 40  # Process every Nth frame to improve performance
-MODEL_INPUT_SIZE = 192       # Smaller input size for faster inference
+PROCESS_EVERY_N_FRAMES = 20  # Process every Nth frame to improve performance
+MODEL_INPUT_SIZE = 320       # Smaller input size for faster inference
 
 # Person tracking settings
 MAX_MISSING_FRAMES = 10  # Remove tracked person after 10 consecutive frames without detection
 IOU_THRESHOLD = 0.3       # Intersection over Union threshold for matching detections to tracks
+
+RED = (0, 0, 255)
+GREEN = (0, 255, 0)
+YELLOW = (0, 255, 255)
 
 
 def calculate_iou(box1, box2):
@@ -101,41 +129,162 @@ def calculate_iou(box1, box2):
     return intersection / union
 
 
+def containment_ratio(inner_box, outer_box):
+    """
+    Fraction of inner_box's own area that lies inside outer_box.
+    Used to decide whether a small item box (Hardhat, vest, ...) belongs
+    to a given person's (much bigger) box.
+    """
+    ix1, iy1, ix2, iy2 = inner_box
+    ox1, oy1, ox2, oy2 = outer_box
+
+    x1 = max(ix1, ox1)
+    y1 = max(iy1, oy1)
+    x2 = min(ix2, ox2)
+    y2 = min(iy2, oy2)
+
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    inter = (x2 - x1) * (y2 - y1)
+    inner_area = (ix2 - ix1) * (iy2 - iy1)
+
+    if inner_area <= 0:
+        return 0.0
+
+    return inter / inner_area
+
+
+def classify_person_ppe(person_box, item_detections):
+    """
+    Given one person's box and every item detection from this frame,
+    decide the person's Hardhat/vest status.
+
+    Returns a dict:
+        {
+            'Hardhat': 'present' | 'missing' | 'unknown',
+            'vest':   'present' | 'missing' | 'unknown',
+            'gloves': 'present' | 'missing' | 'unknown',
+            'goggles': 'present' | 'missing' | 'unknown',
+            'missing_items': [...],
+            'is_violation': bool,
+            'is_fully_compliant': bool,
+            'label': str,
+        }
+    """
+    helmet_positive_seen = False
+    helmet_negative_seen = False
+    vest_positive_seen = False
+    vest_negative_seen = False
+
+    glove_positive_seen = False
+    glove_negative_seen = False
+    goggles_positive_seen = False
+    goggles_negative_seen = False
+
+    for item in item_detections:
+        if containment_ratio(item['box'], person_box) < ITEM_CONTAINMENT_THRESHOLD:
+            continue
+
+        label = item['label']
+        if label in HELMET_POSITIVE:
+            helmet_positive_seen = True
+        elif label in HELMET_NEGATIVE:
+            helmet_negative_seen = True
+        elif label in VEST_POSITIVE:
+            vest_positive_seen = True
+        elif label in VEST_NEGATIVE:
+            vest_negative_seen = True
+
+        elif label in GLOVE_POSITIVE:
+            glove_positive_seen = True
+        elif label in GLOVE_NEGATIVE:
+            glove_negative_seen = True
+        elif label in GOGGLES_POSITIVE:
+            goggles_positive_seen = True
+        elif label in GOGGLES_NEGATIVE:
+            goggles_negative_seen = True
+        
+
+    # An explicit "NO-..." detection always wins over a positive one for
+    # the same item, since the model is actively flagging a violation.
+    if helmet_negative_seen:
+        helmet_status = "missing"
+    elif helmet_positive_seen:
+        helmet_status = "present"
+    else:
+        helmet_status = "unknown"
+
+    if vest_negative_seen:
+        vest_status = "missing"
+    elif vest_positive_seen:
+        vest_status = "present"
+    else:
+        vest_status = "unknown"
+    
+    if glove_negative_seen:
+        glove_status = "missing"
+    elif glove_positive_seen:
+        glove_status = "present"
+    else:
+        glove_status = "unknown"
+
+    if goggles_negative_seen:
+        goggles_status = "missing"
+    elif goggles_positive_seen:
+        goggles_status = "present"
+    else:
+        goggles_status = "unknown"
+    
+
+    missing_items = []
+    if helmet_status == "missing":
+        missing_items.append("Hardhat")
+    if vest_status == "missing":
+        missing_items.append("Vest")
+
+    if glove_status == "missing":
+        missing_items.append("Gloves")
+    if goggles_status == "missing":
+        missing_items.append("Goggles")
+
+    is_violation = len(missing_items) > 0
+    is_fully_compliant = (helmet_status == "present" and vest_status == "present" and glove_status == "present" and goggles_status == "present")
+
+    if is_violation:
+        label_text = "Missing " + " , ".join(missing_items)
+    elif is_fully_compliant:
+        label_text = "Hardhat + Vest + Gloves + Goggles OK"
+    else:
+        label_text = "Person"
+
+    return {
+        "Hardhat": helmet_status,
+        "vest": vest_status,
+        "gloves": glove_status,
+        "goggles": goggles_status,
+        "missing_items": missing_items,
+        "is_violation": is_violation,
+        "is_fully_compliant": is_fully_compliant,
+        "label": label_text,
+    }
+
+
 class PersonTracker:
-    """Track persons across frames to maintain persistent green boxes"""
+    """Track persons across frames to maintain persistent boxes + PPE status"""
 
     def __init__(self):
-        self.tracks = {}  # {track_id: {'box': [x1, y1, x2, y2], 'missing_frames': 0, 'label': str}}
+        self.tracks = {}  # {track_id: {'box', 'missing_frames', 'confidence', 'status'}}
         self.next_id = 0
 
     def calculate_iou(self, box1, box2):
-        x1_1, y1_1, x2_1, y2_1 = box1
-        x1_2, y1_2, x2_2, y2_2 = box2
-
-        x1_i = max(x1_1, x1_2)
-        y1_i = max(y1_1, y1_2)
-        x2_i = min(x2_1, x2_2)
-        y2_i = min(y2_1, y2_2)
-
-        if x2_i <= x1_i or y2_i <= y1_i:
-            return 0.0
-
-        intersection = (x2_i - x1_i) * (y2_i - y1_i)
-
-        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-        union = area1 + area2 - intersection
-
-        if union == 0:
-            return 0.0
-
-        return intersection / union
+        return calculate_iou(box1, box2)
 
     def update(self, detected_persons):
         """
-        Update tracks with new detections
-        detected_persons: list of {'box': [x1, y1, x2, y2], 'label': str, 'confidence': float}
-        Returns: list of all active tracks with their boxes and labels
+        Update tracks with new detections.
+        detected_persons: list of {'box': [x1, y1, x2, y2], 'confidence': float, 'status': dict}
+        Returns: list of all active tracks with their boxes, confidence and PPE status
         """
         for track_id in self.tracks:
             self.tracks[track_id]['missing_frames'] += 1
@@ -159,24 +308,23 @@ class PersonTracker:
             if best_track_id is not None:
                 self.tracks[best_track_id]['box'] = detection_box
                 self.tracks[best_track_id]['missing_frames'] = 0
-                self.tracks[best_track_id]['label'] = detection['label']
                 self.tracks[best_track_id]['confidence'] = detection['confidence']
+                self.tracks[best_track_id]['status'] = detection['status']
                 matched_track_ids.add(best_track_id)
             else:
                 self.tracks[self.next_id] = {
                     'box': detection_box,
                     'missing_frames': 0,
-                    'label': detection['label'],
-                    'confidence': detection['confidence']
+                    'confidence': detection['confidence'],
+                    'status': detection['status'],
                 }
                 matched_track_ids.add(self.next_id)
                 self.next_id += 1
 
-        tracks_to_remove = []
-        for track_id, track in self.tracks.items():
-            if track['missing_frames'] > MAX_MISSING_FRAMES:
-                tracks_to_remove.append(track_id)
-
+        tracks_to_remove = [
+            track_id for track_id, track in self.tracks.items()
+            if track['missing_frames'] > MAX_MISSING_FRAMES
+        ]
         for track_id in tracks_to_remove:
             del self.tracks[track_id]
 
@@ -184,8 +332,8 @@ class PersonTracker:
             {
                 'track_id': track_id,
                 'box': track['box'],
-                'label': track['label'],
-                'confidence': track['confidence']
+                'confidence': track['confidence'],
+                'status': track['status'],
             }
             for track_id, track in self.tracks.items()
         ]
@@ -194,232 +342,197 @@ class PersonTracker:
 # ---------------------------------------------------------------------------
 # Camera / NVR configuration (multi-NVR — see nvr_config.py)
 # ---------------------------------------------------------------------------
-from nvr_config import (
-    ACTIVE_CHANNELS,
-    CAMERA_CONFIGS,
-    NVR_CONFIGS,
-    NVR_IP,
-    PASS_ENC,
-    RAW_PASSWORD,
-    RAW_USERNAME,
-    build_hikvision_rtsp_urls as build_rtsp_urls,
-    build_unifi_rtsp_urls,
-    get_nvr_summary,
-)
+# IMPORTANT: build RTSP URLs with urllib.parse.quote so special characters
+# in the username/password (like "@") are always encoded correctly and
+# consistently. Hand-typing "%40" in a string is error-prone and, if you
+# accidentally also include the raw "@" version, that raw version is
+# actually an invalid URL (two "@" symbols confuses the parser: it splits
+# on the LAST "@", so the password and part of the host get merged into
+# garbage). Never include the un-encoded form as a fallback.
+
+RAW_USERNAME = os.environ.get("NVR_USER_NAME")
+RAW_PASSWORD = os.environ.get("RAW_PASSWORD")
+NVR_IP = os.environ.get("NVR_IP")
+RTSP_PORT = os.environ.get("RTSP_PORT")
+
+USER_ENC = quote(RAW_USERNAME, safe="")
+PASS_ENC = quote(RAW_PASSWORD, safe="")
+
+
+def build_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
+    """
+    Build a list of RTSP URL candidates covering the common NVR/camera
+    brand conventions (Hikvision-style, Dahua-style, Uniview-style).
+    All candidates use properly percent-encoded credentials.
+    """
+    auth = f"{user_enc}:{pass_enc}@{ip}:{port}"
+    hik_channel = f"{channel}01"  # e.g. channel 1 -> 101, channel 2 -> 201
+
+    return [
+        # Uniview-style (IPC2122LB cameras / Uniview NVR — try first)
+        f"rtsp://{auth}/unicast/c{channel}/s0/live",
+        f"rtsp://{auth}/unicast/c{channel}/s1/live",
+        f"rtsp://{auth}/media/video{channel}",
+
+        # Hikvision-style
+        f"rtsp://{auth}/Streaming/Channels/{hik_channel}",
+        f"rtsp://{auth}/Streaming/Channels/{hik_channel}/main",
+        f"rtsp://{auth}/Streaming/Channels/{channel}02",  # sub stream
+
+        # Dahua-style
+        f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=0",
+        f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=1",
+
+        # Generic fallbacks
+        f"rtsp://{auth}/channel{channel}",
+        f"rtsp://{auth}/stream{channel}",
+    ]
+
+
+# List every channel number the NVR has a camera attached to (from your
+# NVR's Camera Management list this was D1 and D2, i.e. channels 1 and 2).
+# Add more numbers here if you connect additional cameras later.
+ACTIVE_CHANNELS = {
+    1: {'location': 'Production Line'},
+    2: {'location': 'Warehouse Entrance'},
+}
+
+CAMERA_CONFIGS = [
+    {
+        'name': f'NVR Channel {channel}',
+        'location': info.get('location', 'Unknown'),
+        'rtsp_urls': build_rtsp_urls(NVR_IP, RTSP_PORT, channel=channel),
+        'ip': NVR_IP
+    }
+    for channel, info in ACTIVE_CHANNELS.items()
+]
 
 CAMERA_LOCATIONS = {config["name"]: config.get("location", "Unknown") for config in CAMERA_CONFIGS}
 
 
-def process_frame(frame, camera_name, frame_count, person_tracker):
-    """Process a single frame with both models"""
-    detected_violations = set()
-    violating_persons = []
-    detected_persons = []
+def draw_person_box(annotated, box, status, confidence, track_id=None):
+    """
+    Draws ONE box per person (green if compliant/unknown, red if a
+    violation was found), a dimensions readout, and the PPE status label.
+    """
+    x1, y1, x2, y2 = box
+    width = x2 - x1
+    height = y2 - y1
 
-    annotated = frame.copy()
+    color = RED if status["is_violation"] else GREEN
+
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 5)
+
+    id_part = f"ID{track_id} " if track_id is not None else ""
+    dims_text = f"{id_part}W:{width} H:{height} ({confidence:.2f})"
+    cv2.putText(annotated, dims_text, (x1, max(15, y1 - 25)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    cv2.putText(annotated, status["label"], (x1, max(15, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return width, height
+
+
+def process_frame(frame, camera_name, frame_count, person_tracker):
+    """
+    Person-first pipeline:
+      1. Detect every person (from both models).
+      2. Detect every PPE item (Hardhat/no_helmet, vest/no_vest, etc.).
+      3. For each person, decide Hardhat/vest status from the items that
+         fall inside that person's box.
+      4. Draw ONE box per person: green + dimensions while compliant/
+         unknown, red + "NO Hardhat / NO Vest" label the moment either
+         item is confirmed missing.
+    """
+    violating_persons = []
+    annotated = frame
 
     if frame_count % PROCESS_EVERY_N_FRAMES != 0:
         active_tracks = person_tracker.update([])
         for track in active_tracks:
-            x1, y1, x2, y2 = track['box']
-            label = track['label']
-            confidence = track['confidence']
-            color = (0, 255, 0)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(annotated, f"{label} {confidence:.2f}",
-                        (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, color, 2)
+            draw_person_box(annotated, track['box'], track['status'],
+                             track['confidence'], track['track_id'])
 
         cv2.putText(annotated, camera_name, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         return annotated
 
     # ---- Run boots model with smaller input size ----
-    with _inference_lock:
-        boots_results = boots_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
-    boots_detections = []
+    boots_results = boots_model.predict(frame, imgsz=960,conf=0.01, verbose=False)
+    raw_detections = []
 
     for result in boots_results:
         for box in result.boxes:
             class_id = int(box.cls[0])
             confidence = float(box.conf[0])
             label = BOOTS_CLASSES.get(class_id, str(class_id))
-
-            if label not in BOOTS_SHOW_LABELS:
-                continue
-
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-            boots_detections.append({
-                'box': [x1, y1, x2, y2],
-                'label': label,
-                'confidence': confidence
-            })
-
-    # Mutual exclusion: boots/no_boots and goggles/no_goggle
-    filtered_boots_detections = []
-    used_boots_indices = set()
-
-    for i, det1 in enumerate(boots_detections):
-        if i in used_boots_indices:
-            continue
-
-        label1 = det1['label']
-        box1 = det1['box']
-
-        conflicting_indices = []
-        for j, det2 in enumerate(boots_detections):
-            if i == j or j in used_boots_indices:
-                continue
-
-            label2 = det2['label']
-            box2 = det2['box']
-
-            is_conflicting = (
-                (label1 == "boots" and label2 == "no_boots") or
-                (label1 == "no_boots" and label2 == "boots") or
-                (label1 == "goggles" and label2 == "no_goggle") or
-                (label1 == "no_goggle" and label2 == "goggles")
-            )
-
-            if is_conflicting:
-                iou = calculate_iou(box1, box2)
-                if iou > 0.3:
-                    conflicting_indices.append(j)
-
-        if conflicting_indices:
-            all_indices = [i] + conflicting_indices
-            best_idx = max(all_indices, key=lambda idx: boots_detections[idx]['confidence'])
-            filtered_boots_detections.append(boots_detections[best_idx])
-            used_boots_indices.update(all_indices)
-        else:
-            filtered_boots_detections.append(det1)
-            used_boots_indices.add(i)
-
-    for detection in filtered_boots_detections:
-        x1, y1, x2, y2 = detection['box']
-        label = detection['label']
-        confidence = detection['confidence']
-
-        if label == "Person":
-            detected_persons.append({
-                'box': [x1, y1, x2, y2],
-                'label': label,
-                'confidence': confidence
-            })
-
-        if label in BOOTS_VIOLATION_LABELS:
-            color = (0, 0, 255)
-            detected_violations.add(label)
-            violating_persons.append({
-                'label': label,
-                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                'confidence': confidence
-            })
-        else:
-            color = (0, 255, 0)
-
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated, f"{label} {confidence:.2f}",
-                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
+            raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
 
     # ---- Run PPE model with smaller input size ----
-    with _inference_lock:
-        ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE, verbose=False)
-    ppe_detections = []
+    person_detections = [d for d in raw_detections if d['label'] == "Person"]
+    if person_detections:
+        ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE,conf=0.35, verbose=False)
+        for result in ppe_results:
+            for box in result.boxes:
+                class_id = int(box.cls[0])
+                confidence = float(box.conf[0])
+                label = PPE_CLASSES.get(class_id, str(class_id))
 
-    for result in ppe_results:
-        for box in result.boxes:
-            class_id = int(box.cls[0])
-            confidence = float(box.conf[0])
-            label = PPE_CLASSES.get(class_id, str(class_id))
+                if label == "Person" and confidence < PERSON_CONFIDENCE_THRESHOLD:
+                    continue
 
-            if label == "Person" and confidence < PERSON_CONFIDENCE_THRESHOLD:
-                continue
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
+    else:
+        ppe_results = []
 
-            if label not in PPE_SHOW_LABELS:
-                continue
 
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+    # Split into persons vs PPE items
+    person_detections = [d for d in raw_detections if d['label'] == "Person"]
+    item_detections = [d for d in raw_detections if d['label'] in ITEM_LABELS]
+    print("----------------")
+    for d in item_detections:
+        print(d['label'], d['confidence'])
 
-            ppe_detections.append({
-                'box': [x1, y1, x2, y2],
-                'label': label,
-                'confidence': confidence
-            })
-
-    # Mutual exclusion: Hardhat/NO-Hardhat and Safety Vest/NO-Safety Vest
-    filtered_detections = []
-    used_indices = set()
-
-    for i, det1 in enumerate(ppe_detections):
-        if i in used_indices:
+    # De-duplicate overlapping person boxes coming from the two models
+    # (keep the highest-confidence box out of any pair that overlaps a lot)
+    deduped_persons = []
+    used = set()
+    for i, p1 in enumerate(person_detections):
+        if i in used:
             continue
-
-        label1 = det1['label']
-        box1 = det1['box']
-
-        conflicting_indices = []
-        for j, det2 in enumerate(ppe_detections):
-            if i == j or j in used_indices:
+        group = [i]
+        for j, p2 in enumerate(person_detections):
+            if j <= i or j in used:
                 continue
+            if calculate_iou(p1['box'], p2['box']) > 0.5:
+                group.append(j)
+        best = max(group, key=lambda idx: person_detections[idx]['confidence'])
+        deduped_persons.append(person_detections[best])
+        used.update(group)
 
-            label2 = det2['label']
-            box2 = det2['box']
+    detected_persons = []
+    for person in deduped_persons:
+        status = classify_person_ppe(person['box'], item_detections)
+        detected_persons.append({
+            'box': person['box'],
+            'confidence': person['confidence'],
+            'status': status,
+        })
 
-            is_conflicting = (
-                (label1 == "Hardhat" and label2 == "NO-Hardhat") or
-                (label1 == "NO-Hardhat" and label2 == "Hardhat") or
-                (label1 == "Safety Vest" and label2 == "NO-Safety Vest") or
-                (label1 == "NO-Safety Vest" and label2 == "Safety Vest")
-            )
-
-            if is_conflicting:
-                iou = calculate_iou(box1, box2)
-                if iou > 0.3:
-                    conflicting_indices.append(j)
-
-        if conflicting_indices:
-            all_indices = [i] + conflicting_indices
-            best_idx = max(all_indices, key=lambda idx: ppe_detections[idx]['confidence'])
-            filtered_detections.append(ppe_detections[best_idx])
-            used_indices.update(all_indices)
-        else:
-            filtered_detections.append(det1)
-            used_indices.add(i)
-
-    for detection in filtered_detections:
-        x1, y1, x2, y2 = detection['box']
-        label = detection['label']
-        confidence = detection['confidence']
-
-        if label == "Person":
-            detected_persons.append({
-                'box': [x1, y1, x2, y2],
-                'label': label,
-                'confidence': confidence
-            })
-
-        if label in PPE_VIOLATION_LABELS:
-            color = (0, 0, 255)
-            detected_violations.add(label)
+        if status["is_violation"]:
             violating_persons.append({
-                'label': label,
-                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                'confidence': confidence
+                'label': " & ".join(status["missing_items"]),
+                'x1': person['box'][0], 'y1': person['box'][1],
+                'x2': person['box'][2], 'y2': person['box'][3],
+                'confidence': person['confidence'],
             })
-        else:
-            color = (0, 255, 0)
 
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated, f"{label} {confidence:.2f}",
-                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
-
-    if detected_violations:
+    if violating_persons:
         alarm.play()
-        print(f"Violations detected: {detected_violations}")
+        print(f"Violations detected: {[p['label'] for p in violating_persons]}")
         print(f"Violating persons count: {len(violating_persons)}")
         screenshot_result = screenshot_manager.take_screenshot(
             frame, violating_persons, camera_name=camera_name
@@ -440,14 +553,8 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     active_tracks = person_tracker.update(detected_persons)
 
     for track in active_tracks:
-        x1, y1, x2, y2 = track['box']
-        label = track['label']
-        confidence = track['confidence']
-        color = (0, 255, 0)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated, f"{label} {confidence:.2f}",
-                    (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
+        draw_person_box(annotated, track['box'], track['status'],
+                         track['confidence'], track['track_id'])
 
     cv2.putText(annotated, camera_name, (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -455,53 +562,68 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     return annotated
 
 
-class ProtectSnapshotCapture:
-    """OpenCV-like capture that pulls JPEG snapshots from UniFi Protect."""
+def camera_worker(config):
+    """
+    Each camera runs independently inside its own thread.
+    """
 
-    is_snapshot = True
+    global latest_frames
+    global running
 
-    def __init__(self, nvr_ip, protect_id, name):
-        self.nvr_ip = nvr_ip
-        self.protect_id = protect_id
-        self.name = name
-        self._opened = True
+    cap, camera_name = open_camera(config)
 
-    def isOpened(self):
-        return self._opened
+    if cap is None:
+        print(f"Unable to connect {config['name']}")
+        return
 
-    def read(self):
-        jpeg = fetch_snapshot_jpeg(self.nvr_ip, self.protect_id)
-        if not jpeg:
-            return False, None
-        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-        if frame is None:
-            return False, None
-        return True, frame
+    frame_counter = 0
 
-    def set(self, *_args, **_kwargs):
-        return False
+    tracker = PersonTracker()
 
-    def release(self):
-        self._opened = False
+    print(f"{camera_name} thread started")
 
+    while running:
 
-def _open_protect_snapshot(config):
-    protect_id = config.get("protect_id")
-    nvr_ip = config.get("nvr_ip") or config.get("ip")
-    if not protect_id or not nvr_ip:
-        return None, None
-    cap = ProtectSnapshotCapture(nvr_ip, protect_id, config["name"])
-    ok, frame = cap.read()
-    if ok and frame is not None:
-        print(f"  Connected using Protect snapshot ({nvr_ip})")
-        return cap, config["name"]
+        cap.grab()
+        success, frame = cap.read()
+
+        if not success:
+
+            print(f"{camera_name} disconnected")
+
+            cap.release()
+
+            while running:
+
+                print(f"Trying reconnect {camera_name}")
+
+                cap, _ = open_camera(config)
+
+                if cap is not None:
+
+                    print(f"{camera_name} reconnected")
+
+                    break
+
+                time.sleep(5)
+
+            continue
+
+        frame_counter += 1
+
+        processed = process_frame(
+            frame,
+            camera_name,
+            frame_counter,
+            tracker
+        )
+
+        with frame_lock:
+            latest_frames[camera_name] = processed
+
     cap.release()
-    return None, None
 
-
-def _camera_key(config):
-    return config.get("protect_id") or config.get("id") or config["name"]
-
+    print(f"{camera_name} thread stopped")
 
 def open_camera(config):
     """
@@ -547,7 +669,7 @@ def open_camera(config):
             if not cap.isOpened():
                 cap.release()
                 continue
-
+            
             ret, frame = cap.read()
             if ret and frame is not None:
                 _working_rtsp_urls[cache_key] = rtsp_url
@@ -566,62 +688,108 @@ def open_camera(config):
 
 
 def main():
-    caps = []
+
+    global running
+
+    threads = []
+
+    print("Starting Camera Threads...")
+
     for config in CAMERA_CONFIGS:
-        cap, name = open_camera(config)
-        if cap is not None:
-            caps.append((cap, name))
 
-    if not caps:
-        print("No cameras connected. Exiting...")
-        print("If every URL failed with '401 Unauthorized', the RTSP")
-        print("username/password is wrong (or the NVR's RTSP-auth account")
-        print("is different from its web-login account) - verify with VLC")
-        print("(Media > Open Network Stream) before re-running this script.")
-        return
+        t = threading.Thread(
+            target=camera_worker,
+            args=(config,),
+            daemon=True
+        )
 
-    print(f"Connected to {len(caps)} camera(s). Press 'q' to quit.")
+        t.start()
 
-    frame_counters = {name: 0 for _, name in caps}
-    person_trackers = {name: PersonTracker() for _, name in caps}
+        threads.append(t)
+
+    print(f"{len(threads)} Camera Thread(s) Started.")
 
     while True:
-        snapshots = []
-        for cap, name in caps:
-            success, frame = cap.read()
-            if success:
-                snapshots.append((name, frame))
-            else:
-                print(f"Failed to read from {name}")
 
-        frames = []
-        for name, frame in snapshots:
-            frame_counters[name] += 1
-            processed_frame = process_frame(
-                frame, name, frame_counters[name], person_trackers[name]
+        with frame_lock:
+            frames = list(latest_frames.values())
+
+        if len(frames) == 0:
+
+            cv2.waitKey(1)
+            continue
+
+        resized = []
+
+        for frame in frames:
+
+            resized.append(
+                cv2.resize(frame, (640,360))
             )
-            frames.append(processed_frame)
 
-        if frames:
-            if len(frames) == 1:
-                display_frame = frames[0]
-            elif len(frames) == 2:
-                frame1 = cv2.resize(frames[0], (640, 360))
-                frame2 = cv2.resize(frames[1], (640, 360))
-                display_frame = cv2.hconcat([frame1, frame2])
-            else:
-                display_frame = cv2.vconcat([cv2.hconcat(frames[i:i + 2]) for i in range(0, len(frames), 2)])
+        if len(resized) == 1:
 
-            cv2.imshow("PPE Detection - Multi-Camera", display_frame)
+            display = resized[0]
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        elif len(resized) == 2:
+
+            display = cv2.hconcat(resized)
+
+        elif len(resized) == 3:
+
+            blank = resized[0].copy()
+            blank[:] = 0
+
+            top = cv2.hconcat(resized[:2])
+            bottom = cv2.hconcat([resized[2], blank])
+
+            display = cv2.vconcat([top,bottom])
+
+        else:
+
+            rows=[]
+
+            for i in range(0,len(resized),2):
+
+                if i+1 < len(resized):
+
+                    row=cv2.hconcat([
+                        resized[i],
+                        resized[i+1]
+                    ])
+
+                else:
+
+                    blank=resized[i].copy()
+                    blank[:]=0
+
+                    row=cv2.hconcat([
+                        resized[i],
+                        blank
+                    ])
+
+                rows.append(row)
+
+            display=cv2.vconcat(rows)
+
+        cv2.imshow(
+            "PPE Detection - Multi Camera",
+            display
+        )
+
+        key=cv2.waitKey(1)
+
+        if key & 0xFF==ord("q"):
+
             break
 
-    for cap, name in caps:
-        cap.release()
-    cv2.destroyAllWindows()
-    alarm.stop()
+    running=False
 
+    time.sleep(1)
+
+    cv2.destroyAllWindows()
+
+    alarm.stop()
 
 if __name__ == "__main__":
     main()
