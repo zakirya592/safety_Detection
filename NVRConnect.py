@@ -467,19 +467,23 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
             raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
 
     # ---- Run PPE model with smaller input size ----
-    ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE,conf=0.35, verbose=False)
+    person_detections = [d for d in raw_detections if d['label'] == "Person"]
+    if person_detections:
+        ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE,conf=0.35, verbose=False)
+        for result in ppe_results:
+            for box in result.boxes:
+                class_id = int(box.cls[0])
+                confidence = float(box.conf[0])
+                label = PPE_CLASSES.get(class_id, str(class_id))
 
-    for result in ppe_results:
-        for box in result.boxes:
-            class_id = int(box.cls[0])
-            confidence = float(box.conf[0])
-            label = PPE_CLASSES.get(class_id, str(class_id))
+                if label == "Person" and confidence < PERSON_CONFIDENCE_THRESHOLD:
+                    continue
 
-            if label == "Person" and confidence < PERSON_CONFIDENCE_THRESHOLD:
-                continue
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
+    else:
+        ppe_results = []
 
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
 
     # Split into persons vs PPE items
     person_detections = [d for d in raw_detections if d['label'] == "Person"]
