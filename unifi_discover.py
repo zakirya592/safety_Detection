@@ -32,26 +32,37 @@ USERNAME = os.environ.get("NVR_USERNAME", "admin")
 PASSWORD = os.environ.get("NVR_PASSWORD", "")
 RTSP_QUALITY = int(os.environ.get("UNIFI_RTSP_QUALITY", "2"))
 
-NVR_HOSTS = [
-    {
-        "id": "nvr1",
-        "name": os.environ.get("NVR1_NAME", "UniFi NVR 1"),
-        "ip": os.environ.get("NVR1_IP", "10.10.30.2"),
-        "expected_count": int(os.environ.get("NVR1_CAMERA_COUNT", "19")),
-    },
-    {
-        "id": "nvr2",
-        "name": os.environ.get("NVR2_NAME", "UniFi NVR 2"),
-        "ip": os.environ.get("NVR2_IP", "10.10.30.3"),
-        "expected_count": int(os.environ.get("NVR2_CAMERA_COUNT", "20")),
-    },
-    {
-        "id": "nvr3",
-        "name": os.environ.get("NVR3_NAME", "UniFi NVR 3"),
-        "ip": os.environ.get("NVR3_IP", "10.10.30.4"),
-        "expected_count": int(os.environ.get("NVR3_CAMERA_COUNT", "18")),
-    },
-]
+def _env_nvr_hosts():
+    """Load only NVRs that have an IP and camera count > 0."""
+    hosts = []
+    defaults = {
+        1: ("UniFi NVR 1", "10.10.30.2", "19"),
+        2: ("UniFi NVR 2", "10.10.30.3", "20"),
+        3: ("UniFi NVR 3", "10.10.30.4", "18"),
+    }
+    for i in (1, 2, 3):
+        default_name, default_ip, default_count = defaults[i]
+        ip_raw = os.environ.get(f"NVR{i}_IP", default_ip)
+        count_raw = os.environ.get(f"NVR{i}_CAMERA_COUNT", default_count)
+        ip = (ip_raw or "").strip()
+        try:
+            count = int(count_raw or "0")
+        except ValueError:
+            count = 0
+        if not ip or count <= 0:
+            continue
+        hosts.append(
+            {
+                "id": f"nvr{i}",
+                "name": os.environ.get(f"NVR{i}_NAME", default_name),
+                "ip": ip,
+                "expected_count": count,
+            }
+        )
+    return hosts
+
+
+NVR_HOSTS = _env_nvr_hosts()
 
 _sessions = {}
 _sessions_lock = threading.Lock()

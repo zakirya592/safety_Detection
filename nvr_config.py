@@ -48,6 +48,20 @@ def build_hikvision_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=P
     ]
 
 
+def build_unv_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
+    """Uniview / UNV NVR RTSP. Main stream first, then sub stream."""
+    auth = f"{user_enc}:{pass_enc}@{ip}:{port}"
+    hik_channel = f"{channel}01"
+    return [
+        f"rtsp://{auth}/unicast/c{channel}/s0/live",
+        f"rtsp://{auth}/unicast/c{channel}/s1/live",
+        f"rtsp://{auth}/media/video{channel}",
+        f"rtsp://{auth}/video{channel}",
+        f"rtsp://{auth}/Streaming/Channels/{hik_channel}",
+        f"rtsp://{auth}/cam/realmonitor?channel={channel}&subtype=0",
+    ]
+
+
 def build_unifi_rtsp_urls(ip, rtsp_token, port=7447, stream_quality=None, camera_ip=None):
     """
     UniFi Protect RTSP on port 7447. Only try the quality suffix we want,
@@ -112,17 +126,48 @@ def _placeholder_cameras(count, nvr_name):
     ]
 
 
+def _host_brand(host):
+    nvr_num = "".join(ch for ch in str(host.get("id", "1")) if ch.isdigit()) or "1"
+    brand = (
+        os.environ.get(f"NVR{nvr_num}_BRAND")
+        or os.environ.get("NVR_BRAND")
+        or "unifi"
+    ).strip().lower()
+    if brand in {"unv", "uniview", "ipc"}:
+        return "unv"
+    return brand
+
+
+def _host_rtsp_port(host, brand):
+    nvr_num = "".join(ch for ch in str(host.get("id", "1")) if ch.isdigit()) or "1"
+    raw = os.environ.get(f"NVR{nvr_num}_RTSP_PORT") or os.environ.get("NVR_RTSP_PORT")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return 7447 if brand == "unifi" else 554
+
+
 def _nvr_from_host(host, discovered=None):
+    brand = _host_brand(host)
     nvr = {
         "id": host["id"],
         "name": host["name"],
         "ip": host["ip"],
-        "brand": "unifi",
-        "rtsp_port": 7447,
+        "brand": brand,
+        "rtsp_port": _host_rtsp_port(host, brand),
     }
 
     if discovered and discovered.get("cameras"):
         nvr["cameras"] = discovered["cameras"]
+        return nvr
+
+    if brand == "unv" and int(host.get("expected_count") or 0) == 2:
+        nvr["cameras"] = [
+            {"name": "UNV Channel 1", "location": "Production Line", "rtsp_token": "", "camera_ip": ""},
+            {"name": "UNV Channel 2", "location": "Warehouse Entrance", "rtsp_token": "", "camera_ip": ""},
+        ]
         return nvr
 
     nvr["cameras"] = _placeholder_cameras(host["expected_count"], host["name"])
@@ -148,12 +193,18 @@ def _rtsp_urls_for_camera(nvr, camera_def, channel_num):
     port = nvr.get("rtsp_port", 554)
 
     if brand == "unifi":
-        return build_unifi_rtsp_urls(
+        urls = build_unifi_rtsp_urls(
             ip,
             camera_def.get("rtsp_token"),
             port=port,
             camera_ip=camera_def.get("camera_ip"),
         )
+        if urls:
+            return urls
+        return build_unv_rtsp_urls(ip, 554, channel=channel_num)
+
+    if brand in {"unv", "uniview"}:
+        return build_unv_rtsp_urls(ip, port, channel=channel_num)
 
     return build_hikvision_rtsp_urls(ip, port, channel=channel_num)
 

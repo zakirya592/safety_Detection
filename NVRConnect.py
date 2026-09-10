@@ -638,7 +638,9 @@ def open_camera(config):
         return None, None
 
     cache_key = _camera_key(config)
-    rtsp_urls = list(config.get("rtsp_urls") or [])[:2]
+    brand = (config.get("nvr_brand") or "").lower()
+    url_limit = 2 if brand == "unifi" else 4
+    rtsp_urls = list(config.get("rtsp_urls") or [])[:url_limit]
     cached_url = _working_rtsp_urls.get(cache_key)
     if cached_url:
         rtsp_urls = [cached_url] + [url for url in rtsp_urls if url != cached_url]
