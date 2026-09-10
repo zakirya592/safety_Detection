@@ -54,6 +54,7 @@ BOOTS_VIOLATION_LABELS = {"no_boots", "no_goggle", "no_gloves"}
 
 # Confidence threshold for Person class only (lowered to 30% to detect more people)
 PERSON_CONFIDENCE_THRESHOLD = 0.30
+# Confidence threshold for Person class only (lowered to 30% to detect more people)
 
 # Set True temporarily to print every raw boots-model detection (class id,
 # label, confidence) before any filtering. Use this to confirm goggles/
@@ -199,7 +200,7 @@ class PersonTracker:
 
 RAW_USERNAME = "admin"
 RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.100.221"
+NVR_IP = "192.168.18.97"
 RTSP_PORT = 554
 
 USER_ENC = quote(RAW_USERNAME, safe="")

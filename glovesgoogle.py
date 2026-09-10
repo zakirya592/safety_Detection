@@ -172,7 +172,7 @@ class PersonTracker:
 
 RAW_USERNAME = "admin"
 RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.100.47"
+NVR_IP = "192.168.18.97"
 RTSP_PORT = 554
 
 USER_ENC = quote(RAW_USERNAME, safe="")
@@ -227,6 +227,7 @@ CAMERA_CONFIGS = [
     }
     for channel, info in ACTIVE_CHANNELS.items()
 ]
+print(CAMERA_CONFIGS)
 
 CAMERA_LOCATIONS = {config["name"]: config.get("location", "Unknown") for config in CAMERA_CONFIGS}
 
