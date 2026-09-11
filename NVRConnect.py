@@ -64,43 +64,74 @@ PPE_CLASSES = {
 }
 
 # ---------------------------------------------------------------------------
-# PPE item classes we care about for the person-level compliance decision.
-# "positive" = the item IS being worn. "negative" = the model explicitly says
-# it is NOT being worn. Anything not seen at all for a person is left as
-# "unknown" rather than assumed compliant or a violation.
+# Detection rules (exact classes the user wants):
+#   1) ppe_model  → Person first
+#   2) ppe_model  → Hardhat, NO-Hardhat, Safety Vest, NO-Safety Vest
+#   3) boots_model → glove, goggles, no_glove, no_goggles
+#   ONE full-person box. Text above.
+#   NO-* / no_* → RED + alarm + screenshot
+#   Hardhat / Safety Vest / glove / goggles / Person → GREEN
 # ---------------------------------------------------------------------------
-HELMET_POSITIVE = {"Hardhat", "helmet"}
-HELMET_NEGATIVE = {"NO-Hardhat", "no_helmet"}
-VEST_POSITIVE = {"Safety Vest", "vest"}
-VEST_NEGATIVE = {"NO-Safety Vest"}
-GLOVE_POSITIVE = {"glove", "gloves"}
-GLOVE_NEGATIVE = {"no_glove", "no_gloves"}
+PPE_POS_LABELS = {"Hardhat", "Safety Vest"}
+PPE_NEG_LABELS = {"NO-Hardhat", "NO-Safety Vest"}
+BOOTS_POS_LABELS = {"glove", "goggles"}
+BOOTS_NEG_LABELS = {"no_glove", "no_goggles"}
 
-GOGGLES_POSITIVE = {"goggles"}
-GOGGLES_NEGATIVE = {"no_goggles", "no_goggle"}
-
-# All the item labels we bother drawing/considering (Person is handled separately)
-ITEM_LABELS = HELMET_POSITIVE | HELMET_NEGATIVE | VEST_POSITIVE | VEST_NEGATIVE | GLOVE_POSITIVE | GLOVE_NEGATIVE | GOGGLES_POSITIVE | GOGGLES_NEGATIVE
+PPE_ITEM_LABELS = PPE_POS_LABELS | PPE_NEG_LABELS
+BOOTS_ITEM_LABELS = BOOTS_POS_LABELS | BOOTS_NEG_LABELS
+ALL_NEG_LABELS = PPE_NEG_LABELS | BOOTS_NEG_LABELS
+ALL_POS_LABELS = PPE_POS_LABELS | BOOTS_POS_LABELS
 
 
-# Confidence threshold for Person class only (lowered to 30% to detect more people)
+def _norm_label(label):
+    s = str(label).strip().lower()
+    s = s.replace("_", "-").replace(" ", "-")
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s
+
+
+_LABEL_CANON = {
+    "hardhat": "Hardhat",
+    "safety-vest": "Safety Vest",
+    "safetyvest": "Safety Vest",
+    "no-hardhat": "NO-Hardhat",
+    "nohardhat": "NO-Hardhat",
+    "no-safety-vest": "NO-Safety Vest",
+    "nosafetyvest": "NO-Safety Vest",
+    "glove": "glove",
+    "gloves": "glove",
+    "goggles": "goggles",
+    "goggle": "goggles",
+    "no-glove": "no_glove",
+    "noglove": "no_glove",
+    "no-gloves": "no_glove",
+    "no-goggles": "no_goggles",
+    "nogoggles": "no_goggles",
+    "no-goggle": "no_goggles",
+}
+
+
+def _canon_item_label(label):
+    """Map raw model label to one of the allowed display names, or None."""
+    return _LABEL_CANON.get(_norm_label(label))
+
+
+# Confidence threshold for Person class only
 PERSON_CONFIDENCE_THRESHOLD = 0.30
 
-# Fraction of an item's own box area that must fall inside a person's box
-# for that item to be considered "worn by" that person.
-ITEM_CONTAINMENT_THRESHOLD = 0.5
+ITEM_CONTAINMENT_THRESHOLD = 0.20
+PERSON_ASSOC_PAD = 0.45
 
-# Performance optimization settings
 PROCESS_EVERY_N_FRAMES = 8
 PERSON_INPUT_SIZE = 640
 PPE_INPUT_SIZE = 640
 BOOTS_INPUT_SIZE = 640
-PPE_ITEM_CONFIDENCE = 0.25
-BOOTS_ITEM_CONFIDENCE = 0.10
+PPE_ITEM_CONFIDENCE = 0.20
+BOOTS_ITEM_CONFIDENCE = 0.15
 
-# Person tracking settings
-MAX_MISSING_FRAMES = 10  # Remove tracked person after 10 consecutive frames without detection
-IOU_THRESHOLD = 0.3       # Intersection over Union threshold for matching detections to tracks
+MAX_MISSING_FRAMES = 10
+IOU_THRESHOLD = 0.3
 
 RED = (0, 0, 255)
 GREEN = (0, 255, 0)
@@ -190,8 +221,18 @@ def _dedupe_persons(person_detections):
     return deduped
 
 
+def _class_ids_for_labels(model, wanted_labels):
+    """Resolve YOLO class indices for a set of display/raw label names."""
+    wanted_norm = {_norm_label(x) for x in wanted_labels}
+    ids = []
+    for idx, name in _model_names(model).items():
+        if _norm_label(name) in wanted_norm or _canon_item_label(name) in wanted_labels:
+            ids.append(idx)
+    return ids
+
+
 def detect_persons(frame):
-    """Step 1: find people first. PPE is not run until this returns someone."""
+    """Step 1: detect Person from ppe_model only."""
     predict_kwargs = {
         "source": frame,
         "imgsz": PERSON_INPUT_SIZE,
@@ -203,37 +244,73 @@ def detect_persons(frame):
         predict_kwargs["classes"] = person_ids
     with _inference_lock:
         results = ppe_model.predict(**predict_kwargs)
-    persons = [d for d in _collect_detections(results, ppe_model, PPE_CLASSES) if _is_person_label(d["label"])]
+    persons = [
+        d for d in _collect_detections(results, ppe_model, PPE_CLASSES)
+        if _is_person_label(d["label"])
+    ]
     return _dedupe_persons(persons)
 
 
 def detect_ppe_for_persons(frame, person_boxes):
-    """Step 2: only after a person is found, inspect PPE on that person."""
+    """
+    Step 2: after Person is found, detect gear on each person crop.
+
+    ppe_model  → Hardhat, NO-Hardhat, Safety Vest, NO-Safety Vest
+    boots_model → glove, goggles, no_glove, no_goggles
+    """
     items = []
+    seen = set()
+
+    def _add_item(det, allowed):
+        canon = _canon_item_label(det["label"])
+        if canon is None or canon not in allowed:
+            return
+        key = (canon, tuple(det["box"]))
+        if key in seen:
+            return
+        seen.add(key)
+        items.append({
+            "box": det["box"],
+            "label": canon,
+            "confidence": det["confidence"],
+        })
+
+    ppe_ids = _class_ids_for_labels(ppe_model, PPE_ITEM_LABELS)
+    boots_ids = _class_ids_for_labels(boots_model, BOOTS_ITEM_LABELS)
+
     for person_box in person_boxes:
-        x1, y1, x2, y2 = _expand_box(person_box, frame.shape, 0.2)
+        x1, y1, x2, y2 = _expand_box(person_box, frame.shape, PERSON_ASSOC_PAD)
         crop = frame[y1:y2, x1:x2]
-        if crop.size == 0 or crop.shape[0] < 16 or crop.shape[1] < 16:
+        if crop.size == 0 or crop.shape[0] < 32 or crop.shape[1] < 32:
             continue
 
         with _inference_lock:
-            ppe_results = ppe_model.predict(
-                crop, imgsz=PPE_INPUT_SIZE, conf=PPE_ITEM_CONFIDENCE, verbose=False
-            )
-            boots_results = boots_model.predict(
-                crop, imgsz=BOOTS_INPUT_SIZE, conf=BOOTS_ITEM_CONFIDENCE, verbose=False
-            )
-        for det in _collect_detections(ppe_results, ppe_model, PPE_CLASSES, min_conf=PPE_ITEM_CONFIDENCE):
-            if _is_person_label(det["label"]) or det["label"] not in ITEM_LABELS:
-                continue
-            det["box"] = _shift_box(det["box"], x1, y1)
-            items.append(det)
+            crop_ppe_kwargs = {
+                "source": crop,
+                "imgsz": PPE_INPUT_SIZE,
+                "conf": PPE_ITEM_CONFIDENCE,
+                "verbose": False,
+            }
+            if ppe_ids:
+                crop_ppe_kwargs["classes"] = ppe_ids
+            crop_boots_kwargs = {
+                "source": crop,
+                "imgsz": BOOTS_INPUT_SIZE,
+                "conf": BOOTS_ITEM_CONFIDENCE,
+                "verbose": False,
+            }
+            if boots_ids:
+                crop_boots_kwargs["classes"] = boots_ids
+            crop_ppe = ppe_model.predict(**crop_ppe_kwargs)
+            crop_boots = boots_model.predict(**crop_boots_kwargs)
 
-        for det in _collect_detections(boots_results, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE):
-            if det["label"] not in ITEM_LABELS:
-                continue
-            det["box"] = _shift_box(det["box"], x1, y1)
-            items.append(det)
+        for det in _collect_detections(crop_ppe, ppe_model, PPE_CLASSES, min_conf=PPE_ITEM_CONFIDENCE):
+            shifted = {**det, "box": _shift_box(det["box"], x1, y1)}
+            _add_item(shifted, PPE_ITEM_LABELS)
+        for det in _collect_detections(crop_boots, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE):
+            shifted = {**det, "box": _shift_box(det["box"], x1, y1)}
+            _add_item(shifted, BOOTS_ITEM_LABELS)
+
     return items
 
 
@@ -263,11 +340,6 @@ def calculate_iou(box1, box2):
 
 
 def containment_ratio(inner_box, outer_box):
-    """
-    Fraction of inner_box's own area that lies inside outer_box.
-    Used to decide whether a small item box (Hardhat, vest, ...) belongs
-    to a given person's (much bigger) box.
-    """
     ix1, iy1, ix2, iy2 = inner_box
     ox1, oy1, ox2, oy2 = outer_box
 
@@ -281,124 +353,78 @@ def containment_ratio(inner_box, outer_box):
 
     inter = (x2 - x1) * (y2 - y1)
     inner_area = (ix2 - ix1) * (iy2 - iy1)
-
     if inner_area <= 0:
         return 0.0
-
     return inter / inner_area
 
 
-def classify_person_ppe(person_box, item_detections):
+def _item_belongs_to_person(item_box, person_box):
+    cx = (item_box[0] + item_box[2]) / 2.0
+    cy = (item_box[1] + item_box[3]) / 2.0
+    if person_box[0] <= cx <= person_box[2] and person_box[1] <= cy <= person_box[3]:
+        return True
+    if calculate_iou(item_box, person_box) >= 0.15:
+        return True
+    return containment_ratio(item_box, person_box) >= ITEM_CONTAINMENT_THRESHOLD
+
+
+def classify_person_ppe(person_box, item_detections, frame_shape=None):
     """
-    Given one person's box and every item detection from this frame,
-    decide the person's Hardhat/vest status.
+    Build ONE status for the person box.
 
-    Returns a dict:
-        {
-            'Hardhat': 'present' | 'missing' | 'unknown',
-            'vest':   'present' | 'missing' | 'unknown',
-            'gloves': 'present' | 'missing' | 'unknown',
-            'goggles': 'present' | 'missing' | 'unknown',
-            'missing_items': [...],
-            'is_violation': bool,
-            'is_fully_compliant': bool,
-            'label': str,
-        }
+    RED  if any of: NO-Hardhat, NO-Safety Vest, no_glove, no_goggles
+    GREEN otherwise, listing Hardhat / Safety Vest / glove / goggles / Person
     """
-    helmet_positive_seen = False
-    helmet_negative_seen = False
-    vest_positive_seen = False
-    vest_negative_seen = False
+    if frame_shape is not None:
+        assoc_box = _expand_box(person_box, frame_shape, PERSON_ASSOC_PAD)
+    else:
+        assoc_box = person_box
 
-    glove_positive_seen = False
-    glove_negative_seen = False
-    goggles_positive_seen = False
-    goggles_negative_seen = False
-
+    # Best confidence per canonical label for this person
+    best_conf = {}
+    matched_items = []
     for item in item_detections:
-        if containment_ratio(item['box'], person_box) < ITEM_CONTAINMENT_THRESHOLD:
+        if not _item_belongs_to_person(item["box"], assoc_box):
             continue
+        label = item["label"]
+        matched_items.append(item)
+        conf = float(item.get("confidence") or 0.0)
+        if conf > best_conf.get(label, 0.0):
+            best_conf[label] = conf
 
-        label = item['label']
-        if label in HELMET_POSITIVE:
-            helmet_positive_seen = True
-        elif label in HELMET_NEGATIVE:
-            helmet_negative_seen = True
-        elif label in VEST_POSITIVE:
-            vest_positive_seen = True
-        elif label in VEST_NEGATIVE:
-            vest_negative_seen = True
+    # Conflict: if both Hardhat and NO-Hardhat, NO wins (same for vest/gloves/goggles)
+    pairs = [
+        ("Hardhat", "NO-Hardhat"),
+        ("Safety Vest", "NO-Safety Vest"),
+        ("glove", "no_glove"),
+        ("goggles", "no_goggles"),
+    ]
+    for pos, neg in pairs:
+        if neg in best_conf:
+            best_conf.pop(pos, None)
 
-        elif label in GLOVE_POSITIVE:
-            glove_positive_seen = True
-        elif label in GLOVE_NEGATIVE:
-            glove_negative_seen = True
-        elif label in GOGGLES_POSITIVE:
-            goggles_positive_seen = True
-        elif label in GOGGLES_NEGATIVE:
-            goggles_negative_seen = True
-        
+    neg_found = [lab for lab in ("NO-Hardhat", "NO-Safety Vest", "no_glove", "no_goggles") if lab in best_conf]
+    pos_found = [lab for lab in ("Hardhat", "Safety Vest", "glove", "goggles") if lab in best_conf]
 
-    # An explicit "NO-..." detection always wins over a positive one for
-    # the same item, since the model is actively flagging a violation.
-    if helmet_negative_seen:
-        helmet_status = "missing"
-    elif helmet_positive_seen:
-        helmet_status = "present"
-    else:
-        helmet_status = "unknown"
-
-    if vest_negative_seen:
-        vest_status = "missing"
-    elif vest_positive_seen:
-        vest_status = "present"
-    else:
-        vest_status = "unknown"
-    
-    if glove_negative_seen:
-        glove_status = "missing"
-    elif glove_positive_seen:
-        glove_status = "present"
-    else:
-        glove_status = "unknown"
-
-    if goggles_negative_seen:
-        goggles_status = "missing"
-    elif goggles_positive_seen:
-        goggles_status = "present"
-    else:
-        goggles_status = "unknown"
-    
-
-    missing_items = []
-    if helmet_status == "missing":
-        missing_items.append("Hardhat")
-    if vest_status == "missing":
-        missing_items.append("Vest")
-
-    if glove_status == "missing":
-        missing_items.append("Gloves")
-    if goggles_status == "missing":
-        missing_items.append("Goggles")
-
-    is_violation = len(missing_items) > 0
-    is_fully_compliant = (helmet_status == "present" and vest_status == "present" and glove_status == "present" and goggles_status == "present")
+    is_violation = len(neg_found) > 0
+    missing_items = list(neg_found)
 
     if is_violation:
-        label_text = "Missing " + " , ".join(missing_items)
-    elif is_fully_compliant:
-        label_text = "Hardhat + Vest + Gloves + Goggles OK"
+        label_text = ", ".join(neg_found)
     else:
-        label_text = "Person"
+        # Always include Person; add positive gear that was seen
+        parts = ["Person"] + pos_found
+        label_text = " | ".join(parts)
 
     return {
-        "Hardhat": helmet_status,
-        "vest": vest_status,
-        "gloves": glove_status,
-        "goggles": goggles_status,
+        "Hardhat": "missing" if "NO-Hardhat" in best_conf else ("present" if "Hardhat" in best_conf else "unknown"),
+        "vest": "missing" if "NO-Safety Vest" in best_conf else ("present" if "Safety Vest" in best_conf else "unknown"),
+        "gloves": "missing" if "no_glove" in best_conf else ("present" if "glove" in best_conf else "unknown"),
+        "goggles": "missing" if "no_goggles" in best_conf else ("present" if "goggles" in best_conf else "unknown"),
+        "matched_items": matched_items,
         "missing_items": missing_items,
         "is_violation": is_violation,
-        "is_fully_compliant": is_fully_compliant,
+        "is_fully_compliant": (not is_violation) and ("Hardhat" in best_conf) and ("Safety Vest" in best_conf),
         "label": label_text,
     }
 
@@ -493,34 +519,48 @@ CAMERA_LOCATIONS = {config["name"]: config.get("location", "Unknown") for config
 
 def draw_person_box(annotated, box, status, confidence, track_id=None):
     """
-    Draws ONE box per person (green if compliant/unknown, red if a
-    violation was found), a dimensions readout, and the PPE status label.
+    ONE full-person box only:
+      RED  + text above  → NO-Hardhat / NO-Safety Vest / no_glove / no_goggles
+      GREEN + text above → Person / Hardhat / Safety Vest / glove / goggles
     """
     x1, y1, x2, y2 = box
-    width = x2 - x1
-    height = y2 - y1
+    color = RED if status.get("is_violation") else GREEN
 
-    color = RED if status["is_violation"] else GREEN
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 4)
 
-    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 5)
-
+    label = status.get("label") or ("Person" if not status.get("is_violation") else "NO-PPE")
     id_part = f"ID{track_id} " if track_id is not None else ""
-    dims_text = f"{id_part}W:{width} H:{height} ({confidence:.2f})"
-    cv2.putText(annotated, dims_text, (x1, max(15, y1 - 25)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    text = f"{id_part}{label}"
 
-    cv2.putText(annotated, status["label"], (x1, max(15, y1 - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    ty = max(th + 8, y1 - 8)
+    cv2.rectangle(
+        annotated,
+        (x1, ty - th - 6),
+        (x1 + tw + 8, ty + baseline),
+        color,
+        -1,
+    )
+    cv2.putText(
+        annotated,
+        text,
+        (x1 + 4, ty - 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+    )
 
-    return width, height
+    return x2 - x1, y2 - y1
 
 
 def process_frame(frame, camera_name, frame_count, person_tracker):
     """
-    Person-first pipeline:
-      1. Detect people with the PPE model (the only model that has Person).
-      2. If nobody is found, skip PPE and keep waiting.
-      3. If a person is found, run helmet/vest/gloves/goggles on that person only.
+    1. Detect Person (ppe_model)
+    2. Detect Hardhat/NO-Hardhat/Safety Vest/NO-Safety Vest (ppe_model)
+       and glove/goggles/no_glove/no_goggles (boots_model) on that person
+    3. ONE full-person box + text above
+    4. Alarm + screenshot only when any NO-* / no_* is present
     """
     violating_persons = []
     annotated = frame
@@ -533,6 +573,7 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         return annotated
 
+    # Step 1: Person
     person_detections = detect_persons(frame)
 
     if not person_detections:
@@ -540,17 +581,24 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         person_tracker.update([])
         cv2.putText(annotated, camera_name, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(annotated, "No person — PPE waiting", (10, 70),
+        cv2.putText(annotated, "No person — waiting", (10, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, YELLOW, 2)
         return annotated
 
+    # Step 2: PPE / gloves on that person
     item_detections = detect_ppe_for_persons(
         frame, [person["box"] for person in person_detections]
+    )
+    print(
+        f"[{camera_name}] persons={len(person_detections)} "
+        f"items={[(d['label'], round(d['confidence'], 2)) for d in item_detections]}"
     )
 
     detected_persons = []
     for person in person_detections:
-        status = classify_person_ppe(person["box"], item_detections)
+        status = classify_person_ppe(
+            person["box"], item_detections, frame_shape=frame.shape
+        )
         detected_persons.append({
             "box": person["box"],
             "confidence": person["confidence"],
@@ -559,16 +607,16 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
 
         if status["is_violation"]:
             violating_persons.append({
-                "label": " & ".join(status["missing_items"]),
+                "label": status["label"],
                 "x1": person["box"][0], "y1": person["box"][1],
                 "x2": person["box"][2], "y2": person["box"][3],
                 "confidence": person["confidence"],
             })
 
+    # Alarm + screenshot only for NO-* / no_*
     if violating_persons:
         alarm.play()
-        print(f"Violations detected: {[p['label'] for p in violating_persons]}")
-        print(f"Violating persons count: {len(violating_persons)}")
+        print(f"Violations: {[p['label'] for p in violating_persons]}")
         screenshot_result = screenshot_manager.take_screenshot(
             frame, violating_persons, camera_name=camera_name
         )
@@ -581,7 +629,7 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
                 image_url=screenshot_result.get("image_url"),
             )
         else:
-            print("Screenshot not saved (possibly already photographed)")
+            print("Screenshot not saved (cooldown)")
     else:
         alarm.stop()
 
@@ -595,7 +643,7 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     cv2.putText(
         annotated,
-        f"Persons: {len(detected_persons)} | PPE on",
+        f"Persons: {len(detected_persons)} | Items: {len(item_detections)}",
         (10, 70),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
