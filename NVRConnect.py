@@ -34,10 +34,14 @@ running = True
 screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 
 # Load both YOLO models
-boots_model = YOLO("bestsss.pt")
+# bestsss.pt barely fires glove/goggle classes on live NVR frames;
+# bestss.pt uses the same labels and actually detects them.
+boots_model = YOLO("bestss.pt")
 ppe_model = YOLO("best.pt")
+print(f"boots_model ({getattr(boots_model, 'ckpt_path', 'bestss.pt')}): {boots_model.names}")
+print(f"ppe_model: {ppe_model.names}")
 
-# Class mapping for the boots model
+# Class mapping for the boots model (bestss.pt)
 BOOTS_CLASSES = {
     0: "glove",
     1: "goggles",
@@ -47,6 +51,8 @@ BOOTS_CLASSES = {
     5: "no_goggles",
     6: "no_helmet",
     7: "no_mask",
+    8: "no_shoes",
+    9: "shoes",
 }
 
 # Class mapping for the PPE model
@@ -66,8 +72,8 @@ PPE_CLASSES = {
 # ---------------------------------------------------------------------------
 # Detection rules (exact classes the user wants):
 #   1) ppe_model  → Person first
-#   2) ppe_model  → Hardhat, NO-Hardhat, Safety Vest, NO-Safety Vest
-#   3) boots_model → glove, goggles, no_glove, no_goggles
+#   2) ppe_model  → Hardhat, NO-Hardhat, Safety Vest, NO-Safety Vest (crops)
+#   3) boots_model → glove, goggles, no_glove, no_goggles (full frame)
 #   ONE full-person box. Text above.
 #   NO-* / no_* → RED + alarm + screenshot
 #   Hardhat / Safety Vest / glove / goggles / Person → GREEN
@@ -126,9 +132,10 @@ PERSON_ASSOC_PAD = 0.45
 PROCESS_EVERY_N_FRAMES = 8
 PERSON_INPUT_SIZE = 640
 PPE_INPUT_SIZE = 640
-BOOTS_INPUT_SIZE = 640
+# gloves/goggles are small — match glovesgoogle.py (full frame + larger imgsz)
+BOOTS_INPUT_SIZE = 960
 PPE_ITEM_CONFIDENCE = 0.20
-BOOTS_ITEM_CONFIDENCE = 0.15
+BOOTS_ITEM_CONFIDENCE = 0.08
 
 MAX_MISSING_FRAMES = 10
 IOU_THRESHOLD = 0.3
@@ -253,10 +260,12 @@ def detect_persons(frame):
 
 def detect_ppe_for_persons(frame, person_boxes):
     """
-    Step 2: after Person is found, detect gear on each person crop.
+    Step 2: after Person is found, detect gear.
 
-    ppe_model  → Hardhat, NO-Hardhat, Safety Vest, NO-Safety Vest
-    boots_model → glove, goggles, no_glove, no_goggles
+    ppe_model  → Hardhat / NO-Hardhat / Safety Vest / NO-Safety Vest
+                 (person crops — works well for larger gear)
+    boots_model → glove / goggles / no_glove / no_goggles
+                 (full frame — small objects miss on tight crops)
     """
     items = []
     seen = set()
@@ -278,6 +287,7 @@ def detect_ppe_for_persons(frame, person_boxes):
     ppe_ids = _class_ids_for_labels(ppe_model, PPE_ITEM_LABELS)
     boots_ids = _class_ids_for_labels(boots_model, BOOTS_ITEM_LABELS)
 
+    # Hardhat / vest on expanded person crops
     for person_box in person_boxes:
         x1, y1, x2, y2 = _expand_box(person_box, frame.shape, PERSON_ASSOC_PAD)
         crop = frame[y1:y2, x1:x2]
@@ -293,23 +303,28 @@ def detect_ppe_for_persons(frame, person_boxes):
             }
             if ppe_ids:
                 crop_ppe_kwargs["classes"] = ppe_ids
-            crop_boots_kwargs = {
-                "source": crop,
-                "imgsz": BOOTS_INPUT_SIZE,
-                "conf": BOOTS_ITEM_CONFIDENCE,
-                "verbose": False,
-            }
-            if boots_ids:
-                crop_boots_kwargs["classes"] = boots_ids
             crop_ppe = ppe_model.predict(**crop_ppe_kwargs)
-            crop_boots = boots_model.predict(**crop_boots_kwargs)
 
         for det in _collect_detections(crop_ppe, ppe_model, PPE_CLASSES, min_conf=PPE_ITEM_CONFIDENCE):
             shifted = {**det, "box": _shift_box(det["box"], x1, y1)}
             _add_item(shifted, PPE_ITEM_LABELS)
-        for det in _collect_detections(crop_boots, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE):
-            shifted = {**det, "box": _shift_box(det["box"], x1, y1)}
-            _add_item(shifted, BOOTS_ITEM_LABELS)
+
+    # Gloves / goggles on the full frame (same settings as glovesgoogle.py)
+    with _inference_lock:
+        boots_kwargs = {
+            "source": frame,
+            "imgsz": BOOTS_INPUT_SIZE,
+            "conf": BOOTS_ITEM_CONFIDENCE,
+            "verbose": False,
+        }
+        if boots_ids:
+            boots_kwargs["classes"] = boots_ids
+        boots_results = boots_model.predict(**boots_kwargs)
+
+    for det in _collect_detections(
+        boots_results, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE
+    ):
+        _add_item(det, BOOTS_ITEM_LABELS)
 
     return items
 
