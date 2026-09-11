@@ -105,18 +105,44 @@ def _get_stream_frame(camera_id=None):
         return cv2.hconcat([f1, f2])
 
 
-def _placeholder_frame(message="Connecting to cameras..."):
+def _placeholder_frame(message="Connecting to cameras...", detail=None):
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
     cv2.putText(
         frame,
         message,
-        (40, 360),
+        (40, 320),
         cv2.FONT_HERSHEY_SIMPLEX,
-        1.2,
+        1.1,
         (255, 255, 255),
         2,
     )
+    if detail:
+        cv2.putText(
+            frame,
+            detail,
+            (40, 380),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (180, 180, 180),
+            2,
+        )
     return frame
+
+
+def _connecting_frame(camera_id=None):
+    cam = _CAMERA_BY_ID.get(camera_id) if camera_id is not None else None
+    if cam:
+        return _placeholder_frame(
+            f"Connecting to {cam['name']}...",
+            f"{cam['nvr_name']} {cam['nvr_ip']}  |  camera {cam['id']}",
+        )
+    if CAMERA_CONFIGS:
+        nvr = CAMERA_CONFIGS[0]
+        return _placeholder_frame(
+            "Connecting to cameras...",
+            f"{nvr['nvr_name']} {nvr['nvr_ip']}  |  {len(CAMERA_CONFIGS)} camera(s)",
+        )
+    return _placeholder_frame("No cameras configured")
 
 
 def _encode_jpeg_frame(frame):
@@ -249,14 +275,14 @@ def _start_camera_workers():
 
 
 def _generate_mjpeg(camera_id=None):
-    placeholder = _encode_jpeg_frame(_placeholder_frame())
+    placeholder = _encode_jpeg_frame(_connecting_frame(camera_id))
     if placeholder is not None:
         yield placeholder
 
     while True:
         frame = _get_stream_frame(camera_id)
         if frame is None:
-            placeholder = _encode_jpeg_frame(_placeholder_frame())
+            placeholder = _encode_jpeg_frame(_connecting_frame(camera_id))
             if placeholder is not None:
                 yield placeholder
             time.sleep(0.5)

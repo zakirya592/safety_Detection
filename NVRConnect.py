@@ -69,15 +69,15 @@ PPE_CLASSES = {
 # it is NOT being worn. Anything not seen at all for a person is left as
 # "unknown" rather than assumed compliant or a violation.
 # ---------------------------------------------------------------------------
-HELMET_POSITIVE = {"Hardhat"}
-HELMET_NEGATIVE = {"NO-Hardhat"}
-VEST_POSITIVE = {"Safety Vest"}
+HELMET_POSITIVE = {"Hardhat", "helmet"}
+HELMET_NEGATIVE = {"NO-Hardhat", "no_helmet"}
+VEST_POSITIVE = {"Safety Vest", "vest"}
 VEST_NEGATIVE = {"NO-Safety Vest"}
-GLOVE_POSITIVE = {"glove"}
-GLOVE_NEGATIVE = {"no_glove"}
+GLOVE_POSITIVE = {"glove", "gloves"}
+GLOVE_NEGATIVE = {"no_glove", "no_gloves"}
 
 GOGGLES_POSITIVE = {"goggles"}
-GOGGLES_NEGATIVE = {"no_goggles"}
+GOGGLES_NEGATIVE = {"no_goggles", "no_goggle"}
 
 # All the item labels we bother drawing/considering (Person is handled separately)
 ITEM_LABELS = HELMET_POSITIVE | HELMET_NEGATIVE | VEST_POSITIVE | VEST_NEGATIVE | GLOVE_POSITIVE | GLOVE_NEGATIVE | GOGGLES_POSITIVE | GOGGLES_NEGATIVE
@@ -91,8 +91,12 @@ PERSON_CONFIDENCE_THRESHOLD = 0.30
 ITEM_CONTAINMENT_THRESHOLD = 0.5
 
 # Performance optimization settings
-PROCESS_EVERY_N_FRAMES = 20  # Process every Nth frame to improve performance
-MODEL_INPUT_SIZE = 320       # Smaller input size for faster inference
+PROCESS_EVERY_N_FRAMES = 8
+PERSON_INPUT_SIZE = 640
+PPE_INPUT_SIZE = 640
+BOOTS_INPUT_SIZE = 640
+PPE_ITEM_CONFIDENCE = 0.25
+BOOTS_ITEM_CONFIDENCE = 0.10
 
 # Person tracking settings
 MAX_MISSING_FRAMES = 10  # Remove tracked person after 10 consecutive frames without detection
@@ -101,6 +105,136 @@ IOU_THRESHOLD = 0.3       # Intersection over Union threshold for matching detec
 RED = (0, 0, 255)
 GREEN = (0, 255, 0)
 YELLOW = (0, 255, 255)
+
+
+def _model_names(model):
+    names = getattr(model, "names", None) or {}
+    if isinstance(names, dict):
+        return {int(k): str(v).strip() for k, v in names.items()}
+    return {i: str(v).strip() for i, v in enumerate(names)}
+
+
+def _class_ids_named(model, label):
+    wanted = str(label).strip().lower()
+    return [idx for idx, name in _model_names(model).items() if name.lower() == wanted]
+
+
+def _is_person_label(label):
+    return str(label).strip().lower() == "person"
+
+
+def _label_for(model, class_id, class_map):
+    names = _model_names(model)
+    if class_id in names and names[class_id]:
+        return names[class_id]
+    return class_map.get(class_id, str(class_id))
+
+
+def _collect_detections(results, model, class_map, min_conf=0.0, person_min_conf=PERSON_CONFIDENCE_THRESHOLD):
+    detections = []
+    for result in results:
+        if result.boxes is None:
+            continue
+        for box in result.boxes:
+            class_id = int(box.cls[0])
+            confidence = float(box.conf[0])
+            label = _label_for(model, class_id, class_map)
+            if _is_person_label(label):
+                if confidence < person_min_conf:
+                    continue
+            elif confidence < min_conf:
+                continue
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            detections.append({
+                "box": [x1, y1, x2, y2],
+                "label": label,
+                "confidence": confidence,
+            })
+    return detections
+
+
+def _expand_box(box, frame_shape, pad_ratio=0.2):
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = box
+    pad_x = int((x2 - x1) * pad_ratio)
+    pad_y = int((y2 - y1) * pad_ratio)
+    return [
+        max(0, x1 - pad_x),
+        max(0, y1 - pad_y),
+        min(w, x2 + pad_x),
+        min(h, y2 + pad_y),
+    ]
+
+
+def _shift_box(box, ox, oy):
+    return [box[0] + ox, box[1] + oy, box[2] + ox, box[3] + oy]
+
+
+def _dedupe_persons(person_detections):
+    deduped = []
+    used = set()
+    for i, p1 in enumerate(person_detections):
+        if i in used:
+            continue
+        group = [i]
+        for j, p2 in enumerate(person_detections):
+            if j <= i or j in used:
+                continue
+            if calculate_iou(p1["box"], p2["box"]) > 0.5:
+                group.append(j)
+        best = max(group, key=lambda idx: person_detections[idx]["confidence"])
+        deduped.append(person_detections[best])
+        used.update(group)
+    return deduped
+
+
+def detect_persons(frame):
+    """Step 1: find people first. PPE is not run until this returns someone."""
+    predict_kwargs = {
+        "source": frame,
+        "imgsz": PERSON_INPUT_SIZE,
+        "conf": PERSON_CONFIDENCE_THRESHOLD,
+        "verbose": False,
+    }
+    person_ids = _class_ids_named(ppe_model, "Person")
+    if person_ids:
+        predict_kwargs["classes"] = person_ids
+    with _inference_lock:
+        results = ppe_model.predict(**predict_kwargs)
+    persons = [d for d in _collect_detections(results, ppe_model, PPE_CLASSES) if _is_person_label(d["label"])]
+    return _dedupe_persons(persons)
+
+
+def detect_ppe_for_persons(frame, person_boxes):
+    """Step 2: only after a person is found, inspect PPE on that person."""
+    items = []
+    for person_box in person_boxes:
+        x1, y1, x2, y2 = _expand_box(person_box, frame.shape, 0.2)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0 or crop.shape[0] < 16 or crop.shape[1] < 16:
+            continue
+
+        with _inference_lock:
+            ppe_results = ppe_model.predict(
+                crop, imgsz=PPE_INPUT_SIZE, conf=PPE_ITEM_CONFIDENCE, verbose=False
+            )
+            boots_results = boots_model.predict(
+                crop, imgsz=BOOTS_INPUT_SIZE, conf=BOOTS_ITEM_CONFIDENCE, verbose=False
+            )
+        for det in _collect_detections(ppe_results, ppe_model, PPE_CLASSES, min_conf=PPE_ITEM_CONFIDENCE):
+            if _is_person_label(det["label"]) or det["label"] not in ITEM_LABELS:
+                continue
+            det["box"] = _shift_box(det["box"], x1, y1)
+            items.append(det)
+
+        for det in _collect_detections(boots_results, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE):
+            if det["label"] not in ITEM_LABELS:
+                continue
+            det["box"] = _shift_box(det["box"], x1, y1)
+            items.append(det)
+    return items
 
 
 def calculate_iou(box1, box2):
@@ -384,97 +518,51 @@ def draw_person_box(annotated, box, status, confidence, track_id=None):
 def process_frame(frame, camera_name, frame_count, person_tracker):
     """
     Person-first pipeline:
-      1. Detect every person (from both models).
-      2. Detect every PPE item (Hardhat/no_helmet, vest/no_vest, etc.).
-      3. For each person, decide Hardhat/vest status from the items that
-         fall inside that person's box.
-      4. Draw ONE box per person: green + dimensions while compliant/
-         unknown, red + "NO Hardhat / NO Vest" label the moment either
-         item is confirmed missing.
+      1. Detect people with the PPE model (the only model that has Person).
+      2. If nobody is found, skip PPE and keep waiting.
+      3. If a person is found, run helmet/vest/gloves/goggles on that person only.
     """
     violating_persons = []
     annotated = frame
 
     if frame_count % PROCESS_EVERY_N_FRAMES != 0:
-        active_tracks = person_tracker.update([])
-        for track in active_tracks:
-            draw_person_box(annotated, track['box'], track['status'],
-                             track['confidence'], track['track_id'])
-
+        for track_id, track in person_tracker.tracks.items():
+            draw_person_box(annotated, track["box"], track["status"],
+                             track["confidence"], track_id)
         cv2.putText(annotated, camera_name, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         return annotated
 
-    # ---- Run boots model with smaller input size ----
-    boots_results = boots_model.predict(frame, imgsz=960,conf=0.01, verbose=False)
-    raw_detections = []
+    person_detections = detect_persons(frame)
 
-    for result in boots_results:
-        for box in result.boxes:
-            class_id = int(box.cls[0])
-            confidence = float(box.conf[0])
-            label = BOOTS_CLASSES.get(class_id, str(class_id))
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
+    if not person_detections:
+        alarm.stop()
+        person_tracker.update([])
+        cv2.putText(annotated, camera_name, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(annotated, "No person — PPE waiting", (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, YELLOW, 2)
+        return annotated
 
-    # ---- Run PPE model with smaller input size ----
-    person_detections = [d for d in raw_detections if d['label'] == "Person"]
-    if person_detections:
-        ppe_results = ppe_model(frame, imgsz=MODEL_INPUT_SIZE,conf=0.35, verbose=False)
-        for result in ppe_results:
-            for box in result.boxes:
-                class_id = int(box.cls[0])
-                confidence = float(box.conf[0])
-                label = PPE_CLASSES.get(class_id, str(class_id))
-
-                if label == "Person" and confidence < PERSON_CONFIDENCE_THRESHOLD:
-                    continue
-
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                raw_detections.append({'box': [x1, y1, x2, y2], 'label': label, 'confidence': confidence})
-    else:
-        ppe_results = []
-
-
-    # Split into persons vs PPE items
-    person_detections = [d for d in raw_detections if d['label'] == "Person"]
-    item_detections = [d for d in raw_detections if d['label'] in ITEM_LABELS]
-    print("----------------")
-    for d in item_detections:
-        print(d['label'], d['confidence'])
-
-    # De-duplicate overlapping person boxes coming from the two models
-    # (keep the highest-confidence box out of any pair that overlaps a lot)
-    deduped_persons = []
-    used = set()
-    for i, p1 in enumerate(person_detections):
-        if i in used:
-            continue
-        group = [i]
-        for j, p2 in enumerate(person_detections):
-            if j <= i or j in used:
-                continue
-            if calculate_iou(p1['box'], p2['box']) > 0.5:
-                group.append(j)
-        best = max(group, key=lambda idx: person_detections[idx]['confidence'])
-        deduped_persons.append(person_detections[best])
-        used.update(group)
+    item_detections = detect_ppe_for_persons(
+        frame, [person["box"] for person in person_detections]
+    )
 
     detected_persons = []
-    for person in deduped_persons:
-        status = classify_person_ppe(person['box'], item_detections)
+    for person in person_detections:
+        status = classify_person_ppe(person["box"], item_detections)
         detected_persons.append({
-            'box': person['box'],
-            'confidence': person['confidence'],
-            'status': status,
+            "box": person["box"],
+            "confidence": person["confidence"],
+            "status": status,
         })
 
         if status["is_violation"]:
             violating_persons.append({
-                'label': " & ".join(status["missing_items"]),
-                'x1': person['box'][0], 'y1': person['box'][1],
-                'x2': person['box'][2], 'y2': person['box'][3],
-                'confidence': person['confidence'],
+                "label": " & ".join(status["missing_items"]),
+                "x1": person["box"][0], "y1": person["box"][1],
+                "x2": person["box"][2], "y2": person["box"][3],
+                "confidence": person["confidence"],
             })
 
     if violating_persons:
@@ -500,11 +588,20 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     active_tracks = person_tracker.update(detected_persons)
 
     for track in active_tracks:
-        draw_person_box(annotated, track['box'], track['status'],
-                         track['confidence'], track['track_id'])
+        draw_person_box(annotated, track["box"], track["status"],
+                         track["confidence"], track["track_id"])
 
     cv2.putText(annotated, camera_name, (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.putText(
+        annotated,
+        f"Persons: {len(detected_persons)} | PPE on",
+        (10, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        GREEN,
+        2,
+    )
 
     return annotated
 
@@ -638,7 +735,9 @@ def open_camera(config):
         return None, None
 
     cache_key = _camera_key(config)
-    rtsp_urls = list(config.get("rtsp_urls") or [])[:2]
+    brand = (config.get("nvr_brand") or "").lower()
+    url_limit = 2 if brand == "unifi" else 4
+    rtsp_urls = list(config.get("rtsp_urls") or [])[:url_limit]
     cached_url = _working_rtsp_urls.get(cache_key)
     if cached_url:
         rtsp_urls = [cached_url] + [url for url in rtsp_urls if url != cached_url]
