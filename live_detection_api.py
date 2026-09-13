@@ -304,6 +304,7 @@ def _camera_public(cam, has_frame=False):
         "nvr_id": cam["nvr_id"],
         "nvr_name": cam["nvr_name"],
         "nvr_ip": cam["nvr_ip"],
+        "cameraIP": cam.get("camera_ip") or "",
         "camera_index": cam["camera_index"],
         "channel": cam.get("channel"),
         "has_frame": has_frame or _has_frame(cam["id"]),
