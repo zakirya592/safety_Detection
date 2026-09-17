@@ -65,12 +65,17 @@ def get_email_settings() -> dict:
     """Return saved notification settings, falling back to ALERT_EMAIL_TO."""
     try:
         with get_db() as db:
+            if not hasattr(db, "emailnotificationsetting"):
+                raise AttributeError(
+                    "Prisma client is missing emailnotificationsetting. "
+                    "Run: python -m prisma generate"
+                )
             setting = db.emailnotificationsetting.find_unique(where={"id": SETTINGS_ID})
             if setting is None:
                 return _env_fallback_settings()
             return _serialize_setting(setting)
     except Exception as exc:
-        logger.warning("Could not load email notification settings: %s", exc)
+        logger.error("Could not load email notification settings: %s", exc)
         return _env_fallback_settings()
 
 
