@@ -16,6 +16,11 @@ from NVRConnect import (
     process_frame,
 )
 from detection_alert_db import get_all_alerts
+from email_notification_db import (
+    get_email_settings,
+    get_recent_email_activity,
+    save_email_settings,
+)
 from notification_logging import setup_notification_logging
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;2500000"
@@ -467,6 +472,58 @@ def detection_alerts():
     return jsonify({"count": len(alerts), "data": alerts})
 
 
+def _email_notification_payload(settings, activity=None):
+    receiving_email = settings.get("receivingEmail") or ""
+    enabled = bool(settings.get("enabled", True))
+    return {
+        "receivingEmail": receiving_email,
+        "attachCapturedPhotos": bool(settings.get("attachCapturedPhotos", True)),
+        "enabled": enabled,
+        "updatedAt": settings.get("updatedAt"),
+        "status": {
+            "notificationsEnabled": enabled,
+            "currentRecipient": receiving_email or None,
+        },
+        "recentActivity": activity if activity is not None else get_recent_email_activity(),
+    }
+
+
+@app.route("/api/email-notifications", methods=["GET"])
+def get_email_notifications():
+    settings = get_email_settings()
+    return jsonify(_email_notification_payload(settings))
+
+
+@app.route("/api/email-notifications", methods=["POST", "PUT"])
+def upsert_email_notifications():
+    body = request.get_json(silent=True) or {}
+    receiving_email = (
+        body.get("receivingEmail")
+        or body.get("recivingEmail")
+        or body.get("receiving_email")
+    )
+    if not receiving_email:
+        return jsonify({"error": "receivingEmail is required"}), 400
+
+    attach_photos = body.get("attachCapturedPhotos")
+    if attach_photos is None:
+        attach_photos = body.get("attach_captured_photos")
+    enabled = body.get("enabled")
+
+    try:
+        settings = save_email_settings(
+            receiving_email=receiving_email,
+            attach_captured_photos=attach_photos,
+            enabled=enabled,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Could not save email settings: {exc}"}), 500
+
+    return jsonify(_email_notification_payload(settings))
+
+
 def main():
     log_file = setup_notification_logging()
     print(f"Notification logs: {log_file}")
@@ -485,6 +542,7 @@ def main():
     print(f"Combined: http://localhost:{PORT}/live-detection")
     print(f"NVR list: http://localhost:{PORT}/api/nvrs")
     print(f"Alerts: http://localhost:{PORT}/detection-alerts")
+    print(f"Email notifications: http://localhost:{PORT}/api/email-notifications")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
 
 

@@ -21,3 +21,26 @@ model DetectionAlert {
 
   @@map("detectionAlert")
 }
+
+model EmailNotificationSetting {
+  id                   Int      @id @default(1)
+  receivingEmail       String   @db.NVarChar(255)
+  attachCapturedPhotos Boolean  @default(true)
+  enabled              Boolean  @default(true)
+  updatedAt            DateTime @updatedAt
+
+  @@map("emailNotificationSetting")
+}
+
+model EmailNotificationLog {
+  id        Int      @id @default(autoincrement())
+  event     String   @db.NVarChar(200)
+  location  String   @db.NVarChar(200)
+  camera    String   @db.NVarChar(100)
+  recipient String   @db.NVarChar(255)
+  status    String   @default("Delivered") @db.NVarChar(20)
+  image_url String?  @db.NVarChar(500)
+  createdAt DateTime @default(now())
+
+  @@map("emailNotificationLog")
+}

@@ -40,17 +40,28 @@ class EmailNotifier:
             "true",
             "yes",
         }
-        configured = bool(self.smtp_user and self.smtp_password and self.alert_to)
+        configured = bool(self.smtp_user and self.smtp_password)
         self.enabled = configured and alerts_enabled
 
         if self.enabled:
-            logger.info("Email notifier enabled (%d recipient(s))", len(self.alert_to))
+            logger.info("Email notifier enabled")
         elif configured and not alerts_enabled:
             logger.info("Email notifier paused (EMAIL_ALERTS_ENABLED=false)")
         else:
             logger.warning(
-                "Email notifier disabled. Set SMTP_USER, SMTP_PASSWORD, and ALERT_EMAIL_TO."
+                "Email notifier disabled. Set SMTP_USER and SMTP_PASSWORD."
             )
+
+    def _load_delivery_settings(self) -> dict:
+        from email_notification_db import get_email_settings, parse_emails
+
+        settings = get_email_settings()
+        recipients = parse_emails(settings.get("receivingEmail")) or list(self.alert_to)
+        return {
+            "recipients": recipients,
+            "attach_photos": bool(settings.get("attachCapturedPhotos", True)),
+            "enabled": bool(settings.get("enabled", True)),
+        }
 
     @staticmethod
     def _format_time(value) -> str:
@@ -217,14 +228,24 @@ class EmailNotifier:
         if not self.enabled or not alerts:
             return False
 
+        delivery = self._load_delivery_settings()
+        recipients = delivery["recipients"]
+        if not delivery["enabled"] or not recipients:
+            logger.info("Email alert skipped — notifications disabled or no receivingEmail")
+            return False
+
+        attached_image = image_url if delivery["attach_photos"] else None
+        event_label = ", ".join({alert.get("event", "Violation") for alert in alerts})
+        recipient_text = ", ".join(recipients)
+
         subject = self.build_subject(camera, location, alerts)
-        html_body = self.build_html(camera, location, alerts, image_url)
-        plain_body = self.build_plain_text(camera, location, alerts, image_url)
+        html_body = self.build_html(camera, location, alerts, attached_image)
+        plain_body = self.build_plain_text(camera, location, alerts, attached_image)
 
         message = MIMEMultipart("alternative")
         message["Subject"] = subject
         message["From"] = self.smtp_from
-        message["To"] = ", ".join(self.alert_to)
+        message["To"] = recipient_text
         message.attach(MIMEText(plain_body, "plain", "utf-8"))
         message.attach(MIMEText(html_body, "html", "utf-8"))
 
@@ -234,8 +255,11 @@ class EmailNotifier:
                 server.starttls()
                 server.ehlo()
                 server.login(self.smtp_user, self.smtp_password)
-                server.sendmail(self.smtp_from, self.alert_to, message.as_string())
-            logger.info("Email alert sent to %s", ", ".join(self.alert_to))
+                server.sendmail(self.smtp_from, recipients, message.as_string())
+            logger.info("Email alert sent to %s", recipient_text)
+            self._record_activity(
+                event_label, location, camera, recipient_text, "Delivered", attached_image
+            )
             return True
         except smtplib.SMTPAuthenticationError as exc:
             logger.error(
@@ -244,10 +268,36 @@ class EmailNotifier:
                 "Create one at: https://myaccount.google.com/apppasswords — %s",
                 exc,
             )
+            self._record_activity(
+                event_label, location, camera, recipient_text, "Failed", attached_image
+            )
             return False
         except Exception as exc:
             logger.error("Failed to send email alert: %s", exc)
+            self._record_activity(
+                event_label, location, camera, recipient_text, "Failed", attached_image
+            )
             return False
+
+    @staticmethod
+    def _record_activity(
+        event: str,
+        location: str,
+        camera: str,
+        recipient: str,
+        status: str,
+        image_url: Optional[str] = None,
+    ) -> None:
+        from email_notification_db import log_email_activity
+
+        log_email_activity(
+            event=event,
+            location=location,
+            camera=camera,
+            recipient=recipient,
+            status=status,
+            image_url=image_url,
+        )
 
     def send_detection_alert_async(
         self,
