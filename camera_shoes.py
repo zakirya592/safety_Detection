@@ -7,7 +7,7 @@ unifi_cameras.json (the three production UniFi NVRs), not the old
 from NVRConnect import main
 
 if __name__ == "__main__":
-    print("Using production UniFi NVRs from .env (192.168.18.97 / .3 / .4).")
+    print("Using production UniFi NVRs from .env (192.168.18.104 / .3 / .4).")
     print("Do not use camera_shoes.py and live_detection_api.py at the same time.")
     print("Prefer:  python unifi_discover.py  then  python live_detection_api.py")
     main()
