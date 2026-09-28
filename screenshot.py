@@ -52,7 +52,16 @@ class ScreenshotManager:
         # Check if there are any new persons to photograph
         new_persons_to_photograph = []
         
+        alarm_labels = {
+            "NO-Hardhat", "NO-Safety Vest", "no_glove", "no_goggles",
+            "no_helmet", "no_goggle", "no_gloves", "no_boots",
+        }
+
         for person_info in violating_persons:
+            parts = [p.strip() for p in str(person_info.get("label", "")).replace("|", ",").split(",")]
+            # Hardhat / helmet means the helmet is on. Do not save that as an alarm.
+            if not any(part in alarm_labels for part in parts):
+                continue
             # Check if this person was already photographed (similar location)
             is_new_person = True
             for photographed in self.photographed_persons:

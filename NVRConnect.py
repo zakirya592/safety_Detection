@@ -103,6 +103,7 @@ _LABEL_CANON = {
     "safetyvest": "Safety Vest",
     "no-hardhat": "NO-Hardhat",
     "nohardhat": "NO-Hardhat",
+    "no_hardhat": "NO-Hardhat",
     "no-safety-vest": "NO-Safety Vest",
     "nosafetyvest": "NO-Safety Vest",
     "glove": "glove",
@@ -407,9 +408,15 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
         if conf > best_conf.get(label, 0.0):
             best_conf[label] = conf
 
-    # Conflict: if both Hardhat and NO-Hardhat, NO wins (same for vest/gloves/goggles)
+    # Helmet: the higher score wins. NO-Hardhat alarms only when it beats Hardhat.
+    # Vest / gloves / goggles: a negative class still wins when both fire.
+    if "Hardhat" in best_conf and "NO-Hardhat" in best_conf:
+        if best_conf["Hardhat"] >= best_conf["NO-Hardhat"]:
+            best_conf.pop("NO-Hardhat", None)
+        else:
+            best_conf.pop("Hardhat", None)
+
     pairs = [
-        ("Hardhat", "NO-Hardhat"),
         ("Safety Vest", "NO-Safety Vest"),
         ("glove", "no_glove"),
         ("goggles", "no_goggles"),
@@ -575,7 +582,9 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     2. Detect Hardhat/NO-Hardhat/Safety Vest/NO-Safety Vest (ppe_model)
        and glove/goggles/no_glove/no_goggles (boots_model) on that person
     3. ONE full-person box + text above
-    4. Alarm + screenshot only when any NO-* / no_* is present
+    4. Helmet alarm + screenshot only when the label is NO-Hardhat.
+       Other missing gear (vest / gloves / goggles) still alarms.
+       A Hardhat detection never alarms.
     """
     violating_persons = []
     annotated = frame
@@ -620,15 +629,23 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
             "status": status,
         })
 
-        if status["is_violation"]:
+        alarm_labels = [
+            lab for lab in (status.get("missing_items") or [])
+            if lab in ("NO-Hardhat", "NO-Safety Vest", "no_glove", "no_goggles")
+        ]
+        # Worn helmet: never alarm or screenshot for Hardhat.
+        # Missing helmet: alarm only under the name NO-Hardhat.
+        if status.get("Hardhat") == "present":
+            alarm_labels = [lab for lab in alarm_labels if lab != "NO-Hardhat"]
+        if alarm_labels:
             violating_persons.append({
-                "label": status["label"],
+                "label": ", ".join(alarm_labels),
                 "x1": person["box"][0], "y1": person["box"][1],
                 "x2": person["box"][2], "y2": person["box"][3],
                 "confidence": person["confidence"],
             })
 
-    # Alarm + screenshot only for NO-* / no_*
+    # Alarm + screenshot for NO-Hardhat and other real missing-gear labels
     if violating_persons:
         alarm.play()
         print(f"Violations: {[p['label'] for p in violating_persons]}")
