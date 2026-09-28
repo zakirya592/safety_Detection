@@ -35,7 +35,7 @@ screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 
 # Load both YOLO models
 boots_model = YOLO("bestsss.pt")
-ppe_model = YOLO("best.pt")
+ppe_model = YOLO("bestt.pt")
 
 # Class mapping for the boots model
 BOOTS_CLASSES = {
