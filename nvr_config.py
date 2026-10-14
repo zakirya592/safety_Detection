@@ -28,6 +28,29 @@ RTSP_QUALITY = int(os.environ.get("UNIFI_RTSP_QUALITY", "2"))
 USER_ENC = quote(RAW_USERNAME, safe="")
 PASS_ENC = quote(RAW_PASSWORD, safe="")
 
+# Outside the warehouse. Live video still runs; the PPE model does not.
+MODEL_SKIP_CAMERA_IPS = {
+    # NVR 2
+    "10.10.30.70",
+    "10.10.30.45",
+    # NVR 3
+    "10.10.30.65",
+    "10.10.30.59",
+    "10.10.30.60",
+    "10.10.30.64",
+    "10.10.30.61",
+    "10.10.30.63",
+    "10.10.30.67",
+    "10.10.30.62",
+    "10.10.30.69",
+}
+
+
+def camera_runs_model(camera):
+    """True when this camera should run PPE detection."""
+    ip = (camera.get("camera_ip") or "").strip()
+    return ip not in MODEL_SKIP_CAMERA_IPS
+
 
 def build_hikvision_rtsp_urls(ip, port, channel=1, user_enc=USER_ENC, pass_enc=PASS_ENC):
     """Hikvision / Dahua / Uniview style RTSP URL candidates."""
@@ -253,6 +276,7 @@ def build_all_camera_configs(nvr_configs=None):
                 used_names,
             )
             location = cam_def.get("location", "Unknown")
+            camera_ip = (cam_def.get("camera_ip") or "").strip()
 
             cameras.append(
                 {
@@ -266,10 +290,11 @@ def build_all_camera_configs(nvr_configs=None):
                     "name": name,
                     "location": location,
                     "ip": nvr_ip,
-                    "camera_ip": cam_def.get("camera_ip", ""),
+                    "camera_ip": camera_ip,
                     "protect_id": cam_def.get("protect_id"),
                     "stream": cam_def.get("stream", "rtsp"),
                     "online": cam_def.get("online", True),
+                    "run_model": camera_ip not in MODEL_SKIP_CAMERA_IPS,
                     "rtsp_urls": _rtsp_urls_for_camera(nvr, cam_def, channel),
                 }
             )
@@ -310,8 +335,15 @@ ACTIVE_CHANNELS = {
 }
 
 _cache_note = "loaded from unifi_cameras.json" if load_cache(CACHE_PATH) else "placeholders until unifi_discover.py runs"
+_model_off = [cam for cam in CAMERA_CONFIGS if not cam.get("run_model", True)]
 print(
     f"NVR config: {len(NVR_CONFIGS)} NVR(s), {len(CAMERA_CONFIGS)} camera(s) ({_cache_note})"
 )
 for _nvr in get_nvr_summary():
     print(f"  {_nvr['id']} {_nvr['ip']}: {_nvr['camera_count']} camera(s)")
+print(
+    f"PPE model off for {len(_model_off)} outdoor camera(s) "
+    f"({len(MODEL_SKIP_CAMERA_IPS)} IP(s) listed)."
+)
+for _cam in _model_off:
+    print(f"  skip model: {_cam['nvr_name']} {_cam['name']} {_cam['camera_ip']}")

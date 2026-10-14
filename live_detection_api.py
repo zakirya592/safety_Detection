@@ -217,12 +217,18 @@ def _process_loop(name, camera_id):
 
 def _start_single_camera(config, camera_id):
     def camera_worker():
-        threading.Thread(
-            target=_process_loop,
-            args=(config["name"], camera_id),
-            daemon=True,
-            name=f"process-{camera_id}",
-        ).start()
+        if config.get("run_model", True):
+            threading.Thread(
+                target=_process_loop,
+                args=(config["name"], camera_id),
+                daemon=True,
+                name=f"process-{camera_id}",
+            ).start()
+        else:
+            print(
+                f"PPE model skipped for {config['name']} "
+                f"({config.get('camera_ip') or 'no ip'}) — outside warehouse."
+            )
 
         while _stream_running:
             cap, name = open_camera(config)
@@ -315,6 +321,7 @@ def _camera_public(cam, has_frame=False):
         "channel": cam.get("channel"),
         "has_frame": has_frame or _has_frame(cam["id"]),
         "online": cam.get("online", True),
+        "runModel": cam.get("run_model", True),
         "stream": cam.get("stream", "rtsp"),
         "endpoint": _camera_endpoint(cam["id"]),
         "nvr_endpoint": _nvr_camera_endpoint(cam["nvr_id"], cam["camera_index"]),

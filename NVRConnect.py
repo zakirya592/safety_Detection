@@ -655,12 +655,15 @@ def camera_worker(config):
 
         frame_counter += 1
 
-        processed = process_frame(
-            frame,
-            camera_name,
-            frame_counter,
-            tracker
-        )
+        if config.get("run_model", True):
+            processed = process_frame(
+                frame,
+                camera_name,
+                frame_counter,
+                tracker
+            )
+        else:
+            processed = frame
 
         with frame_lock:
             latest_frames[camera_name] = processed
