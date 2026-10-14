@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -15,7 +16,7 @@ from NVRConnect import (
     open_camera,
     process_frame,
 )
-from detection_alert_db import get_all_alerts
+from detection_alert_db import list_alert_classes, query_detection_alerts, resolve_alert_classes
 from email_notification_db import (
     get_email_settings,
     get_recent_email_activity,
@@ -465,11 +466,122 @@ def health():
     }
 
 
+_ALERT_STATUSES = {"new": "New", "cleared": "Cleared"}
+_DEFAULT_ALERT_LIMIT = 50
+_MAX_ALERT_LIMIT = 100
+
+
+def _query_values(*names):
+    values = []
+    for name in names:
+        for raw in request.args.getlist(name):
+            values.extend(part.strip() for part in raw.split(",") if part.strip())
+    return values
+
+
+def _first_query_value(*names):
+    for name in names:
+        raw = request.args.get(name)
+        if raw is not None and raw.strip():
+            return raw.strip()
+    return None
+
+
+def _parse_positive_int(name, raw, default, maximum):
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a whole number")
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1")
+    if value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+    return value
+
+
+def _parse_alert_time(value, bound):
+    """Parse YYYY-MM-DD or an ISO datetime. A date-only end includes that whole day."""
+    text = value.strip()
+    date_only = len(text) == 10 and text[4] == "-" and text[7] == "-"
+    normalized = text.replace("Z", "+00:00")
+    if " " in normalized and "T" not in normalized:
+        normalized = normalized.replace(" ", "T", 1)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError(f"{bound} must be YYYY-MM-DD or an ISO datetime")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    if date_only and bound == "end":
+        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999000)
+    return parsed
+
+
 @app.route("/detection-alerts", methods=["GET"])
 def detection_alerts():
-    status = request.args.get("status")
-    alerts = get_all_alerts(status=status)
-    return jsonify({"count": len(alerts), "data": alerts})
+    """
+    Query params:
+      status=New|Cleared
+      start / startDate / from, end / endDate / to  (YYYY-MM-DD or ISO datetime)
+      class / classes / event  (repeatable or comma-separated: no_helmet,no_gloves)
+      page (default 1), limit / pageSize (default 50, max 100)
+    """
+    try:
+        status_raw = _first_query_value("status")
+        status = None
+        if status_raw:
+            status = _ALERT_STATUSES.get(status_raw.lower())
+            if status is None:
+                return jsonify({"error": "status must be New or Cleared"}), 400
+
+        start_raw = _first_query_value("start", "startDate", "from")
+        end_raw = _first_query_value("end", "endDate", "to")
+        start = _parse_alert_time(start_raw, "start") if start_raw else None
+        end = _parse_alert_time(end_raw, "end") if end_raw else None
+        if start and end and start > end:
+            return jsonify({"error": "start must be before or equal to end"}), 400
+
+        classes = _query_values("class", "classes", "event")
+        page = _parse_positive_int("page", request.args.get("page"), 1, 1_000_000)
+        limit = _parse_positive_int(
+            "limit",
+            _first_query_value("limit", "pageSize"),
+            _DEFAULT_ALERT_LIMIT,
+            _MAX_ALERT_LIMIT,
+        )
+        result = query_detection_alerts(
+            status=status,
+            events=resolve_alert_classes(classes),
+            start=start,
+            end=end,
+            page=page,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Could not load alerts: {exc}"}), 500
+
+    data = result["data"]
+    return jsonify(
+        {
+            "count": len(data),
+            "total": result["total"],
+            "page": result["page"],
+            "limit": result["limit"],
+            "totalPages": result["totalPages"],
+            "classes": list_alert_classes(),
+            "filters": {
+                "status": status,
+                "start": start.isoformat() if start else None,
+                "end": end.isoformat() if end else None,
+                "classes": classes,
+            },
+            "data": data,
+        }
+    )
 
 
 def _email_notification_payload(settings, activity=None):
