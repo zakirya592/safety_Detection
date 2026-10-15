@@ -100,6 +100,16 @@ BOOTS_INPUT_SIZE = 640
 PPE_ITEM_CONFIDENCE = 0.25
 BOOTS_ITEM_CONFIDENCE = 0.10
 
+# A missing helmet counts only when no_helmet is at least this confident
+# and stronger than the best Hardhat on the same person.
+HELMET_NEGATIVE_MIN_CONFIDENCE = 0.45
+# Head band used when a hard hat sits above a tight person box.
+HELMET_HEAD_TOP_RATIO = 0.45
+HELMET_HEAD_EXTEND_RATIO = 0.30
+HELMET_CONTAINMENT_THRESHOLD = 0.30
+# Consecutive processed frames a helmet miss must repeat before an alert.
+HELMET_CONFIRM_FRAMES = 2
+
 # Person tracking settings
 MAX_MISSING_FRAMES = 10  # Remove tracked person after 10 consecutive frames without detection
 IOU_THRESHOLD = 0.3       # Intersection over Union threshold for matching detections to tracks
@@ -123,6 +133,10 @@ def _class_ids_named(model, label):
 
 def _is_person_label(label):
     return str(label).strip().lower() == "person"
+
+
+def _label_in(label, names):
+    return str(label).strip().lower() in {name.lower() for name in names}
 
 
 def _label_for(model, class_id, class_map):
@@ -229,12 +243,17 @@ def detect_ppe_for_persons(frame, person_boxes):
             if _is_person_label(det["label"]) or det["label"] not in ITEM_LABELS:
                 continue
             det["box"] = _shift_box(det["box"], x1, y1)
+            det["source"] = "ppe"
             items.append(det)
 
         for det in _collect_detections(boots_results, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE):
+            # Helmet status comes from best_v3 only. bestsss still votes on gloves and goggles.
+            if _label_in(det["label"], HELMET_POSITIVE | HELMET_NEGATIVE):
+                continue
             if det["label"] not in ITEM_LABELS:
                 continue
             det["box"] = _shift_box(det["box"], x1, y1)
+            det["source"] = "boots"
             items.append(det)
     return items
 
@@ -290,10 +309,57 @@ def containment_ratio(inner_box, outer_box):
     return inter / inner_area
 
 
+def helmet_region(person_box):
+    """Head band extended above the body box so a hard hat can still match."""
+    x1, y1, x2, y2 = person_box
+    height = max(1, y2 - y1)
+    top = y1 - int(height * HELMET_HEAD_EXTEND_RATIO)
+    bottom = y1 + int(height * HELMET_HEAD_TOP_RATIO)
+    return [x1, top, x2, max(top + 1, bottom)]
+
+
+def _box_center_inside(inner_box, outer_box):
+    cx = (inner_box[0] + inner_box[2]) / 2
+    cy = (inner_box[1] + inner_box[3]) / 2
+    x1, y1, x2, y2 = outer_box
+    return x1 <= cx <= x2 and y1 <= cy <= y2
+
+
+def _helmet_on_person(item_box, person_box):
+    """True when the helmet box is on the body or on the head above it."""
+    if containment_ratio(item_box, person_box) >= ITEM_CONTAINMENT_THRESHOLD:
+        return True
+    region = helmet_region(person_box)
+    if containment_ratio(item_box, region) >= HELMET_CONTAINMENT_THRESHOLD:
+        return True
+    return _box_center_inside(item_box, region)
+
+
+def _item_on_person(item, person_box):
+    label = item["label"]
+    if _label_in(label, HELMET_POSITIVE | HELMET_NEGATIVE):
+        if item.get("source") == "boots":
+            return False
+        return _helmet_on_person(item["box"], person_box)
+    return containment_ratio(item["box"], person_box) >= ITEM_CONTAINMENT_THRESHOLD
+
+
+def _item_status(positive_conf, negative_conf):
+    """Vest, gloves, and goggles: an explicit miss still wins."""
+    if negative_conf > 0:
+        return "missing"
+    if positive_conf > 0:
+        return "present"
+    return "unknown"
+
+
 def classify_person_ppe(person_box, item_detections):
     """
     Given one person's box and every item detection from this frame,
     decide the person's Hardhat/vest status.
+
+    Helmet misses require no_helmet >= 0.45 and stronger than Hardhat.
+    A fastened helmet that also gets a weaker no_helmet box stays present.
 
     Returns a dict:
         {
@@ -302,92 +368,97 @@ def classify_person_ppe(person_box, item_detections):
             'gloves': 'present' | 'missing' | 'unknown',
             'goggles': 'present' | 'missing' | 'unknown',
             'missing_items': [...],
+            'missing_details': [{'item', 'label', 'confidence'}, ...],
             'is_violation': bool,
             'is_fully_compliant': bool,
             'label': str,
         }
     """
-    helmet_positive_seen = False
-    helmet_negative_seen = False
-    vest_positive_seen = False
-    vest_negative_seen = False
-
-    glove_positive_seen = False
-    glove_negative_seen = False
-    goggles_positive_seen = False
-    goggles_negative_seen = False
+    scores = {
+        "helmet_pos": 0.0,
+        "helmet_neg": 0.0,
+        "vest_pos": 0.0,
+        "vest_neg": 0.0,
+        "glove_pos": 0.0,
+        "glove_neg": 0.0,
+        "goggles_pos": 0.0,
+        "goggles_neg": 0.0,
+    }
 
     for item in item_detections:
-        if containment_ratio(item['box'], person_box) < ITEM_CONTAINMENT_THRESHOLD:
+        if not _item_on_person(item, person_box):
             continue
 
-        label = item['label']
-        if label in HELMET_POSITIVE:
-            helmet_positive_seen = True
-        elif label in HELMET_NEGATIVE:
-            helmet_negative_seen = True
-        elif label in VEST_POSITIVE:
-            vest_positive_seen = True
-        elif label in VEST_NEGATIVE:
-            vest_negative_seen = True
+        label = item["label"]
+        confidence = float(item["confidence"])
+        if _label_in(label, HELMET_POSITIVE):
+            scores["helmet_pos"] = max(scores["helmet_pos"], confidence)
+        elif _label_in(label, HELMET_NEGATIVE):
+            scores["helmet_neg"] = max(scores["helmet_neg"], confidence)
+        elif _label_in(label, VEST_POSITIVE):
+            scores["vest_pos"] = max(scores["vest_pos"], confidence)
+        elif _label_in(label, VEST_NEGATIVE):
+            scores["vest_neg"] = max(scores["vest_neg"], confidence)
+        elif _label_in(label, GLOVE_POSITIVE):
+            scores["glove_pos"] = max(scores["glove_pos"], confidence)
+        elif _label_in(label, GLOVE_NEGATIVE):
+            scores["glove_neg"] = max(scores["glove_neg"], confidence)
+        elif _label_in(label, GOGGLES_POSITIVE):
+            scores["goggles_pos"] = max(scores["goggles_pos"], confidence)
+        elif _label_in(label, GOGGLES_NEGATIVE):
+            scores["goggles_neg"] = max(scores["goggles_neg"], confidence)
 
-        elif label in GLOVE_POSITIVE:
-            glove_positive_seen = True
-        elif label in GLOVE_NEGATIVE:
-            glove_negative_seen = True
-        elif label in GOGGLES_POSITIVE:
-            goggles_positive_seen = True
-        elif label in GOGGLES_NEGATIVE:
-            goggles_negative_seen = True
-        
-
-    # An explicit "NO-..." detection always wins over a positive one for
-    # the same item, since the model is actively flagging a violation.
-    if helmet_negative_seen:
+    if (
+        scores["helmet_neg"] >= HELMET_NEGATIVE_MIN_CONFIDENCE
+        and scores["helmet_neg"] > scores["helmet_pos"]
+    ):
         helmet_status = "missing"
-    elif helmet_positive_seen:
+    elif scores["helmet_pos"] > 0:
         helmet_status = "present"
     else:
         helmet_status = "unknown"
 
-    if vest_negative_seen:
-        vest_status = "missing"
-    elif vest_positive_seen:
-        vest_status = "present"
-    else:
-        vest_status = "unknown"
-    
-    if glove_negative_seen:
-        glove_status = "missing"
-    elif glove_positive_seen:
-        glove_status = "present"
-    else:
-        glove_status = "unknown"
+    vest_status = _item_status(scores["vest_pos"], scores["vest_neg"])
+    glove_status = _item_status(scores["glove_pos"], scores["glove_neg"])
+    goggles_status = _item_status(scores["goggles_pos"], scores["goggles_neg"])
 
-    if goggles_negative_seen:
-        goggles_status = "missing"
-    elif goggles_positive_seen:
-        goggles_status = "present"
-    else:
-        goggles_status = "unknown"
-    
-
-    missing_items = []
+    missing_details = []
     if helmet_status == "missing":
-        missing_items.append("Hardhat")
+        missing_details.append({
+            "item": "helmet",
+            "label": "No Helmet",
+            "confidence": scores["helmet_neg"],
+        })
     if vest_status == "missing":
-        missing_items.append("Vest")
-
+        missing_details.append({
+            "item": "vest",
+            "label": "No Vest",
+            "confidence": scores["vest_neg"],
+        })
     if glove_status == "missing":
-        missing_items.append("Gloves")
+        missing_details.append({
+            "item": "gloves",
+            "label": "No Gloves",
+            "confidence": scores["glove_neg"],
+        })
     if goggles_status == "missing":
-        missing_items.append("Goggles")
+        missing_details.append({
+            "item": "goggles",
+            "label": "No Goggles",
+            "confidence": scores["goggles_neg"],
+        })
 
-    is_violation = len(missing_items) > 0
-    is_fully_compliant = (helmet_status == "present" and vest_status == "present" and glove_status == "present" and goggles_status == "present")
+    missing_items = [item["label"] for item in missing_details]
+    is_violation = len(missing_details) > 0
+    is_fully_compliant = (
+        helmet_status == "present"
+        and vest_status == "present"
+        and glove_status == "present"
+        and goggles_status == "present"
+    )
 
     if is_violation:
-        label_text = "Missing " + " , ".join(missing_items)
+        label_text = " & ".join(missing_items)
     elif is_fully_compliant:
         label_text = "Hardhat + Vest + Gloves + Goggles OK"
     else:
@@ -399,17 +470,28 @@ def classify_person_ppe(person_box, item_detections):
         "gloves": glove_status,
         "goggles": goggles_status,
         "missing_items": missing_items,
+        "missing_details": missing_details,
         "is_violation": is_violation,
         "is_fully_compliant": is_fully_compliant,
         "label": label_text,
     }
 
 
+def _confirmed_missing_items(status, helmet_miss_streak):
+    """Helmet misses alert only after they repeat. Other misses alert immediately."""
+    confirmed = []
+    for item in status.get("missing_details", []):
+        if item["item"] == "helmet" and helmet_miss_streak < HELMET_CONFIRM_FRAMES:
+            continue
+        confirmed.append(item)
+    return confirmed
+
+
 class PersonTracker:
     """Track persons across frames to maintain persistent boxes + PPE status"""
 
     def __init__(self):
-        self.tracks = {}  # {track_id: {'box', 'missing_frames', 'confidence', 'status'}}
+        self.tracks = {}  # {track_id: {'box', 'missing_frames', 'confidence', 'status', 'helmet_miss_streak'}}
         self.next_id = 0
 
     def calculate_iou(self, box1, box2):
@@ -440,11 +522,15 @@ class PersonTracker:
                     best_iou = iou
                     best_track_id = track_id
 
+            helmet_missing = detection['status'].get('Hardhat') == 'missing'
             if best_track_id is not None:
-                self.tracks[best_track_id]['box'] = detection_box
-                self.tracks[best_track_id]['missing_frames'] = 0
-                self.tracks[best_track_id]['confidence'] = detection['confidence']
-                self.tracks[best_track_id]['status'] = detection['status']
+                track = self.tracks[best_track_id]
+                previous_streak = track.get('helmet_miss_streak', 0)
+                track['box'] = detection_box
+                track['missing_frames'] = 0
+                track['confidence'] = detection['confidence']
+                track['status'] = detection['status']
+                track['helmet_miss_streak'] = previous_streak + 1 if helmet_missing else 0
                 matched_track_ids.add(best_track_id)
             else:
                 self.tracks[self.next_id] = {
@@ -452,9 +538,14 @@ class PersonTracker:
                     'missing_frames': 0,
                     'confidence': detection['confidence'],
                     'status': detection['status'],
+                    'helmet_miss_streak': 1 if helmet_missing else 0,
                 }
                 matched_track_ids.add(self.next_id)
                 self.next_id += 1
+
+        for track_id, track in self.tracks.items():
+            if track_id not in matched_track_ids:
+                track['helmet_miss_streak'] = 0
 
         tracks_to_remove = [
             track_id for track_id, track in self.tracks.items()
@@ -469,6 +560,8 @@ class PersonTracker:
                 'box': track['box'],
                 'confidence': track['confidence'],
                 'status': track['status'],
+                'missing_frames': track['missing_frames'],
+                'helmet_miss_streak': track.get('helmet_miss_streak', 0),
             }
             for track_id, track in self.tracks.items()
         ]
@@ -524,7 +617,6 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
       2. If nobody is found, skip PPE and keep waiting.
       3. If a person is found, run helmet/vest/gloves/goggles on that person only.
     """
-    violating_persons = []
     annotated = frame
 
     if frame_count % PROCESS_EVERY_N_FRAMES != 0:
@@ -559,13 +651,22 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
             "status": status,
         })
 
-        if status["is_violation"]:
-            violating_persons.append({
-                "label": " & ".join(status["missing_items"]),
-                "x1": person["box"][0], "y1": person["box"][1],
-                "x2": person["box"][2], "y2": person["box"][3],
-                "confidence": person["confidence"],
-            })
+    active_tracks = person_tracker.update(detected_persons)
+
+    violating_persons = []
+    for track in active_tracks:
+        if track["missing_frames"] != 0:
+            continue
+        confirmed = _confirmed_missing_items(track["status"], track["helmet_miss_streak"])
+        if not confirmed:
+            continue
+        box = track["box"]
+        violating_persons.append({
+            "label": " & ".join(item["label"] for item in confirmed),
+            "x1": box[0], "y1": box[1],
+            "x2": box[2], "y2": box[3],
+            "confidence": min(item["confidence"] for item in confirmed),
+        })
 
     if violating_persons:
         alarm.play()
@@ -586,8 +687,6 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
             print("Screenshot not saved (possibly already photographed)")
     else:
         alarm.stop()
-
-    active_tracks = person_tracker.update(detected_persons)
 
     for track in active_tracks:
         draw_person_box(annotated, track["box"], track["status"],

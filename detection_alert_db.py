@@ -24,6 +24,10 @@ EVENT_LABELS = {
     "no_goggle": "No Goggles Detected",
     "no_gloves": "No Gloves Detected",
     "no_helmet": "No Helmet Detected",
+    "No Helmet": "No Helmet Detected",
+    "No Vest": "No Safety Vest Detected",
+    "No Gloves": "No Gloves Detected",
+    "No Goggles": "No Goggles Detected",
     "Hardhat": "Helmet Detected",
     "Safety Vest": "Safety Vest Detected",
     "Mask": "Mask Detected",
@@ -40,13 +44,13 @@ ALERT_CLASSES = [
         "class": "no_helmet",
         "label": "No Helmet",
         "terms": ["Helmet", "Hardhat"],
-        "aliases": ["no_helmet", "helmet", "hardhat", "NO-Hardhat", "No Helmet Detected", "Helmet Detected"],
+        "aliases": ["no_helmet", "helmet", "hardhat", "NO-Hardhat", "No Helmet", "No Helmet Detected", "Helmet Detected"],
     },
     {
         "class": "no_safety_vest",
         "label": "No Safety Vest",
         "terms": ["Vest"],
-        "aliases": ["no_safety_vest", "no_vest", "vest", "NO-Safety Vest", "No Safety Vest Detected", "Safety Vest"],
+        "aliases": ["no_safety_vest", "no_vest", "vest", "NO-Safety Vest", "No Vest", "No Safety Vest Detected", "Safety Vest"],
     },
     {
         "class": "no_mask",
@@ -64,19 +68,26 @@ ALERT_CLASSES = [
         "class": "no_goggles",
         "label": "No Goggles",
         "terms": ["Goggle"],
-        "aliases": ["no_goggles", "no_goggle", "goggles", "No Goggles Detected"],
+        "aliases": ["no_goggles", "no_goggle", "goggles", "No Goggles", "No Goggles Detected"],
     },
     {
         "class": "no_gloves",
         "label": "No Gloves",
         "terms": ["Glove"],
-        "aliases": ["no_gloves", "no_glove", "gloves", "No Gloves Detected"],
+        "aliases": ["no_gloves", "no_glove", "gloves", "No Gloves", "No Gloves Detected"],
     },
 ]
 
 
 def format_detection_event(label: str) -> str:
-    return EVENT_LABELS.get(label, label.replace("_", " ").replace("-", " ").title())
+    parts = [part.strip() for part in str(label).split("&") if part.strip()]
+    if not parts:
+        return ""
+    formatted = [
+        EVENT_LABELS.get(part, part.replace("_", " ").replace("-", " ").title())
+        for part in parts
+    ]
+    return " & ".join(formatted)
 
 
 def _class_token(value: str) -> str:
