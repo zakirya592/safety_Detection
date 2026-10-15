@@ -33,9 +33,11 @@ running = True
 # Initialize screenshot manager with 30-second reset time
 screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 
-# Load both YOLO models
-boots_model = YOLO("bestsss.pt")
-ppe_model = YOLO("bestt.pt")
+# Load both YOLO models. Paths are next to this file so the API can import
+# NVRConnect from any working directory.
+_MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
+boots_model = YOLO(os.path.join(_MODEL_DIR, "bestsss.pt"))
+ppe_model = YOLO(os.path.join(_MODEL_DIR, "best_v3.pt"))
 
 # Class mapping for the boots model
 BOOTS_CLASSES = {
