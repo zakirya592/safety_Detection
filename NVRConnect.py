@@ -468,11 +468,17 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
     neg_found = [lab for lab in neg_order if lab in best_conf]
     pos_found = [lab for lab in pos_order if lab in best_conf]
 
+    display_names = {
+        "Hardhat": "Helmet",
+        "NO-Hardhat": "No Helmet",
+    }
+
     def _with_score(lab):
+        shown = display_names.get(lab, lab)
         score = best_conf[lab]
         if score <= 0:
-            return lab
-        return f"{lab} {score:.2f}"
+            return shown
+        return f"{shown} {score:.2f}"
 
     is_violation = len(neg_found) > 0
     missing_items = list(neg_found)
