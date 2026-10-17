@@ -22,6 +22,8 @@ EVENT_LABELS = {
     "NO-Mask": "No Mask Detected",
     "no_boots": "No Boots Detected",
     "no_goggle": "No Goggles Detected",
+    "no_goggles": "No Goggles Detected",
+    "no_glove": "No Gloves Detected",
     "no_gloves": "No Gloves Detected",
     "no_helmet": "No Helmet Detected",
     "No Helmet": "No Helmet Detected",
@@ -33,6 +35,7 @@ EVENT_LABELS = {
     "Mask": "Mask Detected",
     "boots": "Boots Detected",
     "goggles": "Goggles Detected",
+    "glove": "Gloves Detected",
     "gloves": "Gloves Detected",
 }
 

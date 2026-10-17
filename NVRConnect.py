@@ -37,7 +37,9 @@ screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 # NVRConnect from any working directory.
 _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 boots_model = YOLO(os.path.join(_MODEL_DIR, "bestsss.pt"))
-ppe_model = YOLO(os.path.join(_MODEL_DIR, "best_v3.pt"))
+# best v3.2.pt from ZakiryaNVR. Same class ids as before:
+# Hardhat, Mask, NO-Hardhat, NO-Mask, NO-Safety Vest, Person, Safety Vest.
+ppe_model = YOLO(os.path.join(_MODEL_DIR, "best v3.2.pt"))
 
 # Class mapping for the boots model
 BOOTS_CLASSES = {
@@ -139,11 +141,60 @@ def _label_in(label, names):
     return str(label).strip().lower() in {name.lower() for name in names}
 
 
+def _norm_label(label):
+    text = str(label).strip().lower().replace("_", "-").replace(" ", "-")
+    while "--" in text:
+        text = text.replace("--", "-")
+    return text
+
+
+# Raw names from best v3.2.pt (and close spellings) mapped to the names this
+# file already decides on. Worn Hardhat is shown as Helmet, not as a violation.
+_LABEL_CANON = {
+    "hardhat": "Hardhat",
+    "mask": "Mask",
+    "no-mask": "NO-Mask",
+    "nomask": "NO-Mask",
+    "safety-vest": "Safety Vest",
+    "safetyvest": "Safety Vest",
+    "no-hardhat": "NO-Hardhat",
+    "nohardhat": "NO-Hardhat",
+    "no-safety-vest": "NO-Safety Vest",
+    "nosafetyvest": "NO-Safety Vest",
+    "glove": "glove",
+    "gloves": "glove",
+    "goggles": "goggles",
+    "goggle": "goggles",
+    "no-glove": "no_glove",
+    "noglove": "no_glove",
+    "no-gloves": "no_glove",
+    "no-goggles": "no_goggles",
+    "nogoggles": "no_goggles",
+    "no-goggle": "no_goggles",
+    "helmet": "Hardhat",
+    "no-helmet": "NO-Hardhat",
+}
+
+DISPLAY_NAMES = {
+    "Hardhat": "Helmet",
+    "NO-Hardhat": "No Helmet",
+}
+
+
+def _canon_item_label(label):
+    """Map a raw model label onto Hardhat / NO-Hardhat / vest / gloves, or None."""
+    return _LABEL_CANON.get(_norm_label(label))
+
+
 def _label_for(model, class_id, class_map):
     names = _model_names(model)
     if class_id in names and names[class_id]:
-        return names[class_id]
-    return class_map.get(class_id, str(class_id))
+        raw = names[class_id]
+    else:
+        raw = class_map.get(class_id, str(class_id))
+    if _is_person_label(raw):
+        return raw
+    return _canon_item_label(raw) or raw
 
 
 def _collect_detections(results, model, class_map, min_conf=0.0, person_min_conf=PERSON_CONFIDENCE_THRESHOLD):
@@ -426,7 +477,7 @@ def classify_person_ppe(person_box, item_detections):
     if helmet_status == "missing":
         missing_details.append({
             "item": "helmet",
-            "label": "No Helmet",
+            "label": DISPLAY_NAMES["NO-Hardhat"],
             "confidence": scores["helmet_neg"],
         })
     if vest_status == "missing":
@@ -460,7 +511,7 @@ def classify_person_ppe(person_box, item_detections):
     if is_violation:
         label_text = " & ".join(missing_items)
     elif is_fully_compliant:
-        label_text = "Hardhat + Vest + Gloves + Goggles OK"
+        label_text = DISPLAY_NAMES["Hardhat"] + " + Vest + Gloves + Goggles OK"
     else:
         label_text = "Person"
 

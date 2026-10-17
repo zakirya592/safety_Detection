@@ -76,7 +76,8 @@ class ScreenshotManager:
         for person_info in new_persons_to_photograph:
             cv2.rectangle(screenshot_frame, (person_info['x1'], person_info['y1']), 
                         (person_info['x2'], person_info['y2']), (0, 0, 255), 2)
-            cv2.putText(screenshot_frame, f"{person_info['label']} {person_info['confidence']:.2f}", 
+            shown = str(person_info["label"]).replace("NO-Hardhat", "No Helmet").replace("Hardhat", "Helmet")
+            cv2.putText(screenshot_frame, f"{shown} {person_info['confidence']:.2f}", 
                        (person_info['x1'], person_info['y1'] - 5), cv2.FONT_HERSHEY_SIMPLEX, 
                        0.6, (0, 0, 255), 2)
         
