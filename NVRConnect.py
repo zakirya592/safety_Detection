@@ -37,9 +37,10 @@ screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 # bestsss.pt barely fires glove/goggle classes on live NVR frames;
 # bestss.pt uses the same labels and actually detects them.
 boots_model = YOLO("bestss.pt")
-ppe_model = YOLO("best.pt")
+# Person and PPE classes (Hardhat, NO-Hardhat, vest) all come from this file.
+ppe_model = YOLO("best v3.2.pt")
 print(f"boots_model ({getattr(boots_model, 'ckpt_path', 'bestss.pt')}): {boots_model.names}")
-print(f"ppe_model: {ppe_model.names}")
+print(f"ppe_model v3.2: {ppe_model.names}")
 
 # Class mapping for the boots model (bestss.pt)
 BOOTS_CLASSES = {
@@ -71,15 +72,15 @@ PPE_CLASSES = {
 
 # ---------------------------------------------------------------------------
 # Detection rules (exact classes the user wants):
-#   1) ppe_model  → Person first
-#   2) ppe_model  → Hardhat, NO-Hardhat, Safety Vest, NO-Safety Vest (crops)
-#   3) boots_model → glove, goggles, no_glove, no_goggles (full frame)
+#   1) best v3.2.pt, one pass → Person, Hardhat, Mask, NO-Hardhat,
+#      Safety Vest, NO-Safety Vest
+#   2) boots_model → glove, goggles, no_glove, no_goggles (full frame)
 #   ONE full-person box. Text above.
 #   NO-* / no_* → RED + alarm + screenshot
 #   Hardhat / Safety Vest / glove / goggles / Person → GREEN
 # ---------------------------------------------------------------------------
-PPE_POS_LABELS = {"Hardhat", "Safety Vest"}
-PPE_NEG_LABELS = {"NO-Hardhat", "NO-Safety Vest"}
+PPE_POS_LABELS = {"Hardhat", "Mask", "Safety Vest"}
+PPE_NEG_LABELS = {"NO-Hardhat", "NO-Mask", "NO-Safety Vest"}
 BOOTS_POS_LABELS = {"glove", "goggles"}
 BOOTS_NEG_LABELS = {"no_glove", "no_goggles"}
 
@@ -99,6 +100,9 @@ def _norm_label(label):
 
 _LABEL_CANON = {
     "hardhat": "Hardhat",
+    "mask": "Mask",
+    "no-mask": "NO-Mask",
+    "nomask": "NO-Mask",
     "safety-vest": "Safety Vest",
     "safetyvest": "Safety Vest",
     "no-hardhat": "NO-Hardhat",
@@ -137,6 +141,10 @@ PPE_INPUT_SIZE = 640
 BOOTS_INPUT_SIZE = 960
 PPE_ITEM_CONFIDENCE = 0.20
 BOOTS_ITEM_CONFIDENCE = 0.08
+# A close person whose head is in frame, with no Hardhat class from v3.2.
+# This camera view does not make the model emit NO-Hardhat on its own.
+HEAD_VISIBLE_MIN_HEIGHT = 160
+HELMET_LABELS = {"Hardhat", "NO-Hardhat"}
 
 MAX_MISSING_FRAMES = 10
 IOU_THRESHOLD = 0.3
@@ -239,41 +247,50 @@ def _class_ids_for_labels(model, wanted_labels):
     return ids
 
 
-def detect_persons(frame):
-    """Step 1: detect Person from ppe_model only."""
+def detect_ppe_scene(frame):
+    """
+    One best v3.2.pt pass.
+
+    Person and the other PPE classes (Hardhat, Mask, NO-Hardhat, Safety Vest,
+    NO-Safety Vest) come from this same result. No class-id filter, so a
+    class the model emits cannot be dropped before we read it.
+    """
     predict_kwargs = {
         "source": frame,
         "imgsz": PERSON_INPUT_SIZE,
-        "conf": PERSON_CONFIDENCE_THRESHOLD,
+        "conf": PPE_ITEM_CONFIDENCE,
         "verbose": False,
     }
-    person_ids = _class_ids_named(ppe_model, "Person")
-    if person_ids:
-        predict_kwargs["classes"] = person_ids
     with _inference_lock:
         results = ppe_model.predict(**predict_kwargs)
-    persons = [
-        d for d in _collect_detections(results, ppe_model, PPE_CLASSES)
-        if _is_person_label(d["label"])
-    ]
-    return _dedupe_persons(persons)
+    detections = _collect_detections(
+        results, ppe_model, PPE_CLASSES, min_conf=PPE_ITEM_CONFIDENCE
+    )
+    persons = []
+    items = []
+    for det in detections:
+        if _is_person_label(det["label"]):
+            persons.append(det)
+            continue
+        canon = _canon_item_label(det["label"])
+        if canon is None or canon not in PPE_ITEM_LABELS:
+            continue
+        items.append({
+            "box": det["box"],
+            "label": canon,
+            "confidence": det["confidence"],
+        })
+    return _dedupe_persons(persons), items
 
 
 def detect_ppe_for_persons(frame, person_boxes):
-    """
-    Step 2: after Person is found, detect gear.
-
-    ppe_model  → Hardhat / NO-Hardhat / Safety Vest / NO-Safety Vest
-                 (person crops — works well for larger gear)
-    boots_model → glove / goggles / no_glove / no_goggles
-                 (full frame — small objects miss on tight crops)
-    """
+    """boots_model → glove / goggles / no_glove / no_goggles on the full frame."""
     items = []
     seen = set()
 
     def _add_item(det, allowed):
-        canon = _canon_item_label(det["label"])
-        if canon is None or canon not in allowed:
+        canon = _canon_item_label(det["label"]) or det["label"]
+        if canon not in allowed:
             return
         key = (canon, tuple(det["box"]))
         if key in seen:
@@ -285,30 +302,7 @@ def detect_ppe_for_persons(frame, person_boxes):
             "confidence": det["confidence"],
         })
 
-    ppe_ids = _class_ids_for_labels(ppe_model, PPE_ITEM_LABELS)
     boots_ids = _class_ids_for_labels(boots_model, BOOTS_ITEM_LABELS)
-
-    # Hardhat / vest on expanded person crops
-    for person_box in person_boxes:
-        x1, y1, x2, y2 = _expand_box(person_box, frame.shape, PERSON_ASSOC_PAD)
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0 or crop.shape[0] < 32 or crop.shape[1] < 32:
-            continue
-
-        with _inference_lock:
-            crop_ppe_kwargs = {
-                "source": crop,
-                "imgsz": PPE_INPUT_SIZE,
-                "conf": PPE_ITEM_CONFIDENCE,
-                "verbose": False,
-            }
-            if ppe_ids:
-                crop_ppe_kwargs["classes"] = ppe_ids
-            crop_ppe = ppe_model.predict(**crop_ppe_kwargs)
-
-        for det in _collect_detections(crop_ppe, ppe_model, PPE_CLASSES, min_conf=PPE_ITEM_CONFIDENCE):
-            shifted = {**det, "box": _shift_box(det["box"], x1, y1)}
-            _add_item(shifted, PPE_ITEM_LABELS)
 
     # Gloves / goggles on the full frame (same settings as glovesgoogle.py)
     with _inference_lock:
@@ -374,6 +368,43 @@ def containment_ratio(inner_box, outer_box):
     return inter / inner_area
 
 
+def _person_box_from_head(head_box, frame_shape):
+    """Grow a helmet box downward so the track covers the person."""
+    frame_h, frame_w = frame_shape[:2]
+    x1, y1, x2, y2 = head_box
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    pad_x = int(bw * 0.6)
+    return [
+        max(0, x1 - pad_x),
+        max(0, y1 - int(bh * 0.15)),
+        min(frame_w, x2 + pad_x),
+        min(frame_h, y2 + int(bh * 3.2)),
+    ]
+
+
+def _persons_from_ppe_items(items, frame_shape):
+    """Start a person track from Hardhat / NO-Hardhat / vest when Person did not fire."""
+    persons = []
+    ordered = sorted(
+        (det for det in items if det["label"] in PPE_ITEM_LABELS),
+        key=lambda det: (det["label"] not in HELMET_LABELS, -det["confidence"]),
+    )
+    for det in ordered:
+        if any(_item_belongs_to_person(det["box"], person["box"]) for person in persons):
+            continue
+        if det["label"] in HELMET_LABELS:
+            box = _person_box_from_head(det["box"], frame_shape)
+        else:
+            box = _expand_box(det["box"], frame_shape, 0.45)
+        persons.append({
+            "box": box,
+            "label": "Person",
+            "confidence": det["confidence"],
+        })
+    return persons
+
+
 def _item_belongs_to_person(item_box, person_box):
     cx = (item_box[0] + item_box[2]) / 2.0
     cy = (item_box[1] + item_box[3]) / 2.0
@@ -408,6 +439,13 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
         if conf > best_conf.get(label, 0.0):
             best_conf[label] = conf
 
+    # v3.2 often returns only Person on this overhead view. A close, fully
+    # visible head with no Hardhat box is a missing helmet.
+    px1, py1, px2, py2 = person_box
+    if (py2 - py1) >= HEAD_VISIBLE_MIN_HEIGHT and py1 > 4:
+        if "Hardhat" not in best_conf and "NO-Hardhat" not in best_conf:
+            best_conf["NO-Hardhat"] = 0.0
+
     # Helmet: the higher score wins. NO-Hardhat alarms only when it beats Hardhat.
     # Vest / gloves / goggles: a negative class still wins when both fire.
     if "Hardhat" in best_conf and "NO-Hardhat" in best_conf:
@@ -418,6 +456,7 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
 
     pairs = [
         ("Safety Vest", "NO-Safety Vest"),
+        ("Mask", "NO-Mask"),
         ("glove", "no_glove"),
         ("goggles", "no_goggles"),
     ]
@@ -425,21 +464,30 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
         if neg in best_conf:
             best_conf.pop(pos, None)
 
-    neg_found = [lab for lab in ("NO-Hardhat", "NO-Safety Vest", "no_glove", "no_goggles") if lab in best_conf]
-    pos_found = [lab for lab in ("Hardhat", "Safety Vest", "glove", "goggles") if lab in best_conf]
+    neg_order = ("NO-Hardhat", "NO-Safety Vest", "NO-Mask", "no_glove", "no_goggles")
+    pos_order = ("Hardhat", "Mask", "Safety Vest", "glove", "goggles")
+    neg_found = [lab for lab in neg_order if lab in best_conf]
+    pos_found = [lab for lab in pos_order if lab in best_conf]
+
+    def _with_score(lab):
+        score = best_conf[lab]
+        if score <= 0:
+            return lab
+        return f"{lab} {score:.2f}"
 
     is_violation = len(neg_found) > 0
     missing_items = list(neg_found)
 
+    # Keep the PPE class names on the box. A glove violation must not hide Hardhat.
+    parts = [_with_score(lab) for lab in neg_found + pos_found]
     if is_violation:
-        label_text = ", ".join(neg_found)
+        label_text = ", ".join(parts) if parts else "NO-PPE"
     else:
-        # Always include Person; add positive gear that was seen
-        parts = ["Person"] + pos_found
-        label_text = " | ".join(parts)
+        label_text = " | ".join(["Person"] + parts)
 
     return {
         "Hardhat": "missing" if "NO-Hardhat" in best_conf else ("present" if "Hardhat" in best_conf else "unknown"),
+        "mask": "missing" if "NO-Mask" in best_conf else ("present" if "Mask" in best_conf else "unknown"),
         "vest": "missing" if "NO-Safety Vest" in best_conf else ("present" if "Safety Vest" in best_conf else "unknown"),
         "gloves": "missing" if "no_glove" in best_conf else ("present" if "glove" in best_conf else "unknown"),
         "goggles": "missing" if "no_goggles" in best_conf else ("present" if "goggles" in best_conf else "unknown"),
@@ -597,8 +645,13 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         return annotated
 
-    # Step 1: Person
-    person_detections = detect_persons(frame)
+    # One v3.2 pass returns Person and Hardhat / Mask / vest together.
+    person_detections, ppe_items = detect_ppe_scene(frame)
+    item_detections = ppe_items + detect_ppe_for_persons(
+        frame, [person["box"] for person in person_detections]
+    )
+    if not person_detections:
+        person_detections = _persons_from_ppe_items(item_detections, frame.shape)
 
     if not person_detections:
         alarm.stop()
@@ -608,11 +661,6 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         cv2.putText(annotated, "No person — waiting", (10, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, YELLOW, 2)
         return annotated
-
-    # Step 2: PPE / gloves on that person
-    item_detections = detect_ppe_for_persons(
-        frame, [person["box"] for person in person_detections]
-    )
     print(
         f"[{camera_name}] persons={len(person_detections)} "
         f"items={[(d['label'], round(d['confidence'], 2)) for d in item_detections]}"

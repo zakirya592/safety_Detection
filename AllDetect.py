@@ -200,7 +200,7 @@ class PersonTracker:
 
 RAW_USERNAME = "admin"
 RAW_PASSWORD = "Eisa@1234"
-NVR_IP = "192.168.18.104"
+NVR_IP = "192.168.18.130"
 RTSP_PORT = 554
 
 USER_ENC = quote(RAW_USERNAME, safe="")
