@@ -134,7 +134,6 @@ PERSON_CONFIDENCE_THRESHOLD = 0.30
 ITEM_CONTAINMENT_THRESHOLD = 0.20
 PERSON_ASSOC_PAD = 0.45
 
-PROCESS_EVERY_N_FRAMES = 8
 PERSON_INPUT_SIZE = 640
 PPE_INPUT_SIZE = 640
 # gloves/goggles are small — match glovesgoogle.py (full frame + larger imgsz)
@@ -146,7 +145,7 @@ BOOTS_ITEM_CONFIDENCE = 0.08
 HEAD_VISIBLE_MIN_HEIGHT = 160
 HELMET_LABELS = {"Hardhat", "NO-Hardhat"}
 
-MAX_MISSING_FRAMES = 10
+MAX_MISSING_FRAMES = 1
 IOU_THRESHOLD = 0.3
 
 RED = (0, 0, 255)
@@ -530,8 +529,18 @@ class PersonTracker:
                     continue
 
                 iou = self.calculate_iou(detection_box, track['box'])
-                if iou > best_iou and iou > IOU_THRESHOLD:
-                    best_iou = iou
+                # Same person still counts after a step, when the boxes barely overlap.
+                cx1 = (detection_box[0] + detection_box[2]) / 2.0
+                cy1 = (detection_box[1] + detection_box[3]) / 2.0
+                cx2 = (track['box'][0] + track['box'][2]) / 2.0
+                cy2 = (track['box'][1] + track['box'][3]) / 2.0
+                dist = ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5
+                reach = max(detection_box[2] - detection_box[0], detection_box[3] - detection_box[1], 80)
+                score = iou
+                if dist < reach:
+                    score = max(score, IOU_THRESHOLD + 0.01)
+                if score > best_iou and score > IOU_THRESHOLD:
+                    best_iou = score
                     best_track_id = track_id
 
             if best_track_id is not None:
@@ -563,8 +572,10 @@ class PersonTracker:
                 'box': track['box'],
                 'confidence': track['confidence'],
                 'status': track['status'],
+                'missing_frames': track['missing_frames'],
             }
             for track_id, track in self.tracks.items()
+            if track['missing_frames'] == 0
         ]
 
 
@@ -637,15 +648,7 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     violating_persons = []
     annotated = frame
 
-    if frame_count % PROCESS_EVERY_N_FRAMES != 0:
-        for track_id, track in person_tracker.tracks.items():
-            draw_person_box(annotated, track["box"], track["status"],
-                             track["confidence"], track_id)
-        cv2.putText(annotated, camera_name, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        return annotated
-
-    # One v3.2 pass returns Person and Hardhat / Mask / vest together.
+    # Detect on this frame. The box is the person in this image, not an older position.
     person_detections, ppe_items = detect_ppe_scene(frame)
     item_detections = ppe_items + detect_ppe_for_persons(
         frame, [person["box"] for person in person_detections]
