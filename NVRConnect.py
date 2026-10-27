@@ -129,7 +129,7 @@ def _canon_item_label(label):
 
 
 # Confidence threshold for Person class only
-PERSON_CONFIDENCE_THRESHOLD = 0.30
+PERSON_CONFIDENCE_THRESHOLD = 0.50
 
 ITEM_CONTAINMENT_THRESHOLD = 0.20
 PERSON_ASSOC_PAD = 0.45
@@ -139,7 +139,7 @@ PPE_INPUT_SIZE = 640
 # gloves/goggles are small — match glovesgoogle.py (full frame + larger imgsz)
 BOOTS_INPUT_SIZE = 960
 PPE_ITEM_CONFIDENCE = 0.20
-BOOTS_ITEM_CONFIDENCE = 0.08
+BOOTS_ITEM_CONFIDENCE = 0.30
 # A close person whose head is in frame, with no Hardhat class from v3.2.
 # This camera view does not make the model emit NO-Hardhat on its own.
 HEAD_VISIBLE_MIN_HEIGHT = 160
