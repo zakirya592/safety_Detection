@@ -36,7 +36,8 @@ screenshot_manager = ScreenshotManager(reset_time_seconds=15)
 # Load both YOLO models. Paths are next to this file so the API can import
 # NVRConnect from any working directory.
 _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
-boots_model = YOLO(os.path.join(_MODEL_DIR, "bestsss.pt"))
+# bestss.pt (ZakiryaNVR): same glove/goggle labels as bestsss, fires more on live frames.
+boots_model = YOLO(os.path.join(_MODEL_DIR, "bestss.pt"))
 # best v3.2.pt from ZakiryaNVR. Same class ids as before:
 # Hardhat, Mask, NO-Hardhat, NO-Mask, NO-Safety Vest, Person, Safety Vest.
 ppe_model = YOLO(os.path.join(_MODEL_DIR, "best v3.2.pt"))
@@ -87,8 +88,8 @@ GOGGLES_NEGATIVE = {"no_goggles", "no_goggle"}
 ITEM_LABELS = HELMET_POSITIVE | HELMET_NEGATIVE | VEST_POSITIVE | VEST_NEGATIVE | GLOVE_POSITIVE | GLOVE_NEGATIVE | GOGGLES_POSITIVE | GOGGLES_NEGATIVE
 
 
-# Confidence threshold for Person class only (lowered to 30% to detect more people)
-PERSON_CONFIDENCE_THRESHOLD = 0.30
+# Confidence threshold for Person class only (ZakiryaNVR: 0.60 cuts weak FPs)
+PERSON_CONFIDENCE_THRESHOLD = 0.60
 
 # Fraction of an item's own box area that must fall inside a person's box
 # for that item to be considered "worn by" that person.
@@ -98,9 +99,13 @@ ITEM_CONTAINMENT_THRESHOLD = 0.5
 PROCESS_EVERY_N_FRAMES = 8
 PERSON_INPUT_SIZE = 640
 PPE_INPUT_SIZE = 640
-BOOTS_INPUT_SIZE = 640
+# gloves/goggles are small — match ZakiryaNVR / glovesgoogle (larger imgsz)
+BOOTS_INPUT_SIZE = 960
 PPE_ITEM_CONFIDENCE = 0.25
-BOOTS_ITEM_CONFIDENCE = 0.10
+# Distant hands often score ~0.05–0.08; keep low but only after person association.
+BOOTS_ITEM_CONFIDENCE = 0.05
+# Extra pad when linking glove/goggle boxes to a person (hands sit beside/below body).
+BOOTS_ASSOC_PAD = 1.20
 
 # A missing helmet counts only when no_helmet is at least this confident
 # and stronger than the best Hardhat on the same person.
@@ -274,6 +279,75 @@ def detect_persons(frame):
     return _dedupe_persons(persons)
 
 
+def _boots_crop_regions(person_box, frame_shape):
+    """Wide body pad + lower hand band so gloves beside the body still get cropped."""
+    px1, py1, px2, py2 = person_box
+    ph = max(1, py2 - py1)
+    pw = max(1, px2 - px1)
+    h, w = frame_shape[:2]
+    return [
+        _expand_box(person_box, frame_shape, 1.0),
+        [
+            max(0, px1 - int(pw * 1.5)),
+            max(0, py1 + int(ph * 0.25)),
+            min(w, px2 + int(pw * 1.5)),
+            min(h, py2 + int(ph * 0.35)),
+        ],
+    ]
+
+
+def _predict_boots_on_crop(crop, ox, oy, scale=1.0):
+    """Run glove/goggle model on one crop and map boxes back to the full frame."""
+    items = []
+    with _inference_lock:
+        boots_results = boots_model.predict(
+            crop, imgsz=BOOTS_INPUT_SIZE, conf=BOOTS_ITEM_CONFIDENCE, verbose=False
+        )
+    for det in _collect_detections(
+        boots_results, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE
+    ):
+        # Helmet status comes from best v3.2 only. boots model votes on gloves and goggles.
+        if _label_in(det["label"], HELMET_POSITIVE | HELMET_NEGATIVE):
+            continue
+        if det["label"] not in ITEM_LABELS:
+            continue
+        bx1, by1, bx2, by2 = det["box"]
+        if scale != 1.0:
+            bx1, by1, bx2, by2 = [int(round(v / scale)) for v in (bx1, by1, bx2, by2)]
+        det["box"] = _shift_box([bx1, by1, bx2, by2], ox, oy)
+        det["source"] = "boots"
+        items.append(det)
+    return items
+
+
+def _filter_boots_to_persons(boots_items, person_boxes, frame_shape=None):
+    """Keep glove/goggle hits only when they belong to a real person box."""
+    if not person_boxes or not boots_items:
+        return []
+
+    filtered = []
+    for item in boots_items:
+        if not _label_in(item["label"], GLOVE_POSITIVE | GLOVE_NEGATIVE | GOGGLES_POSITIVE | GOGGLES_NEGATIVE):
+            filtered.append(item)
+            continue
+        matched = False
+        for person_box in person_boxes:
+            assoc = (
+                _expand_box(person_box, frame_shape, BOOTS_ASSOC_PAD)
+                if frame_shape is not None
+                else person_box
+            )
+            if containment_ratio(item["box"], assoc) >= ITEM_CONTAINMENT_THRESHOLD:
+                matched = True
+                break
+            if _box_center_inside(item["box"], assoc):
+                matched = True
+                break
+        if matched:
+            filtered.append(item)
+    return filtered
+
+
 def detect_ppe_for_persons(frame, person_boxes):
     """Step 2: only after a person is found, inspect PPE on that person."""
     items = []
@@ -287,9 +361,6 @@ def detect_ppe_for_persons(frame, person_boxes):
             ppe_results = ppe_model.predict(
                 crop, imgsz=PPE_INPUT_SIZE, conf=PPE_ITEM_CONFIDENCE, verbose=False
             )
-            boots_results = boots_model.predict(
-                crop, imgsz=BOOTS_INPUT_SIZE, conf=BOOTS_ITEM_CONFIDENCE, verbose=False
-            )
         for det in _collect_detections(ppe_results, ppe_model, PPE_CLASSES, min_conf=PPE_ITEM_CONFIDENCE):
             if _is_person_label(det["label"]) or det["label"] not in ITEM_LABELS:
                 continue
@@ -297,15 +368,33 @@ def detect_ppe_for_persons(frame, person_boxes):
             det["source"] = "ppe"
             items.append(det)
 
-        for det in _collect_detections(boots_results, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE):
-            # Helmet status comes from best_v3 only. bestsss still votes on gloves and goggles.
-            if _label_in(det["label"], HELMET_POSITIVE | HELMET_NEGATIVE):
+    # Gloves / goggles: wide crops + optional upscale (ZakiryaNVR), then person filter.
+    boots_items = []
+    seen = set()
+    for person_box in person_boxes:
+        for x1, y1, x2, y2 in _boots_crop_regions(person_box, frame.shape):
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0 or crop.shape[0] < 16 or crop.shape[1] < 16:
                 continue
-            if det["label"] not in ITEM_LABELS:
-                continue
-            det["box"] = _shift_box(det["box"], x1, y1)
-            det["source"] = "boots"
-            items.append(det)
+            ch, cw = crop.shape[:2]
+            scale = 1.0
+            target_min = 480
+            min_side = min(ch, cw)
+            if min_side < target_min:
+                scale = target_min / float(min_side)
+                crop = cv2.resize(
+                    crop,
+                    (max(32, int(cw * scale)), max(32, int(ch * scale))),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+            for det in _predict_boots_on_crop(crop, ox=x1, oy=y1, scale=scale):
+                key = (det["label"], tuple(det["box"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                boots_items.append(det)
+
+    items.extend(_filter_boots_to_persons(boots_items, person_boxes, frame_shape=frame.shape))
     return items
 
 
@@ -386,12 +475,22 @@ def _helmet_on_person(item_box, person_box):
     return _box_center_inside(item_box, region)
 
 
-def _item_on_person(item, person_box):
+def _item_on_person(item, person_box, frame_shape=None):
     label = item["label"]
     if _label_in(label, HELMET_POSITIVE | HELMET_NEGATIVE):
         if item.get("source") == "boots":
             return False
         return _helmet_on_person(item["box"], person_box)
+    # Hands often sit beside/below the body — use a wider pad for gloves/goggles.
+    if _label_in(label, GLOVE_POSITIVE | GLOVE_NEGATIVE | GOGGLES_POSITIVE | GOGGLES_NEGATIVE):
+        assoc = (
+            _expand_box(person_box, frame_shape, BOOTS_ASSOC_PAD)
+            if frame_shape is not None
+            else person_box
+        )
+        if containment_ratio(item["box"], assoc) >= ITEM_CONTAINMENT_THRESHOLD:
+            return True
+        return _box_center_inside(item["box"], assoc)
     return containment_ratio(item["box"], person_box) >= ITEM_CONTAINMENT_THRESHOLD
 
 
@@ -404,7 +503,7 @@ def _item_status(positive_conf, negative_conf):
     return "unknown"
 
 
-def classify_person_ppe(person_box, item_detections):
+def classify_person_ppe(person_box, item_detections, frame_shape=None):
     """
     Given one person's box and every item detection from this frame,
     decide the person's Hardhat/vest status.
@@ -437,7 +536,7 @@ def classify_person_ppe(person_box, item_detections):
     }
 
     for item in item_detections:
-        if not _item_on_person(item, person_box):
+        if not _item_on_person(item, person_box, frame_shape=frame_shape):
             continue
 
         label = item["label"]
@@ -695,7 +794,9 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
 
     detected_persons = []
     for person in person_detections:
-        status = classify_person_ppe(person["box"], item_detections)
+        status = classify_person_ppe(
+            person["box"], item_detections, frame_shape=frame.shape
+        )
         detected_persons.append({
             "box": person["box"],
             "confidence": person["confidence"],
