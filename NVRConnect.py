@@ -414,6 +414,24 @@ def _item_belongs_to_person(item_box, person_box):
     return containment_ratio(item_box, person_box) >= ITEM_CONTAINMENT_THRESHOLD
 
 
+def _filter_boots_to_persons(boots_items, person_detections):
+    """Keep glove/goggle hits only when they belong to a real Person box."""
+    if not person_detections or not boots_items:
+        return []
+
+    filtered = []
+    for item in boots_items:
+        if item["label"] not in BOOTS_ITEM_LABELS:
+            filtered.append(item)
+            continue
+        if any(
+            _item_belongs_to_person(item["box"], person["box"])
+            for person in person_detections
+        ):
+            filtered.append(item)
+    return filtered
+
+
 def classify_person_ppe(person_box, item_detections, frame_shape=None):
     """
     Build ONE status for the person box.
@@ -656,11 +674,21 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
 
     # Detect on this frame. The box is the person in this image, not an older position.
     person_detections, ppe_items = detect_ppe_scene(frame)
-    item_detections = ppe_items + detect_ppe_for_persons(
-        frame, [person["box"] for person in person_detections]
-    )
+
+    # Helmet/vest can still create a person track if Person class missed
     if not person_detections:
-        person_detections = _persons_from_ppe_items(item_detections, frame.shape)
+        person_detections = _persons_from_ppe_items(ppe_items, frame.shape)
+
+    # Gloves/goggles only on real persons (blocks railing / empty-scene FPs)
+    if person_detections:
+        boots_items = detect_ppe_for_persons(
+            frame, [person["box"] for person in person_detections]
+        )
+        boots_items = _filter_boots_to_persons(boots_items, person_detections)
+    else:
+        boots_items = []
+
+    item_detections = ppe_items + boots_items
 
     if not person_detections:
         alarm.stop()
