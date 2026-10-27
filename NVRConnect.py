@@ -129,7 +129,7 @@ def _canon_item_label(label):
 
 
 # Confidence threshold for Person class only
-PERSON_CONFIDENCE_THRESHOLD = 0.50
+PERSON_CONFIDENCE_THRESHOLD = 0.60
 
 ITEM_CONTAINMENT_THRESHOLD = 0.20
 PERSON_ASSOC_PAD = 0.45
@@ -139,7 +139,10 @@ PPE_INPUT_SIZE = 640
 # gloves/goggles are small — match glovesgoogle.py (full frame + larger imgsz)
 BOOTS_INPUT_SIZE = 960
 PPE_ITEM_CONFIDENCE = 0.20
-BOOTS_ITEM_CONFIDENCE = 0.30
+# Distant hands often score ~0.05–0.08; keep low but only after person association.
+BOOTS_ITEM_CONFIDENCE = 0.05
+# Extra pad when linking glove/goggle boxes to a person (hands sit beside/below body).
+BOOTS_ASSOC_PAD = 1.20
 # A close person whose head is in frame, with no Hardhat class from v3.2.
 # This camera view does not make the model emit NO-Hardhat on its own.
 HEAD_VISIBLE_MIN_HEIGHT = 160
@@ -283,9 +286,15 @@ def detect_ppe_scene(frame):
 
 
 def detect_ppe_for_persons(frame, person_boxes):
-    """boots_model → glove / goggles / no_glove / no_goggles on the full frame."""
+    """
+    boots_model → glove / goggles / no_glove / no_goggles.
+
+    Runs full-frame + wide person crops. Caller must filter to real persons
+    (_filter_boots_to_persons) so railing FPs without a Person are dropped.
+    """
     items = []
     seen = set()
+    boots_ids = _class_ids_for_labels(boots_model, BOOTS_ITEM_LABELS)
 
     def _add_item(det, allowed):
         canon = _canon_item_label(det["label"]) or det["label"]
@@ -301,24 +310,68 @@ def detect_ppe_for_persons(frame, person_boxes):
             "confidence": det["confidence"],
         })
 
-    boots_ids = _class_ids_for_labels(boots_model, BOOTS_ITEM_LABELS)
+    def _predict_source(source, ox=0, oy=0, scale=1.0):
+        with _inference_lock:
+            boots_kwargs = {
+                "source": source,
+                "imgsz": BOOTS_INPUT_SIZE,
+                "conf": BOOTS_ITEM_CONFIDENCE,
+                "verbose": False,
+            }
+            if boots_ids:
+                boots_kwargs["classes"] = boots_ids
+            boots_results = boots_model.predict(**boots_kwargs)
+        for det in _collect_detections(
+            boots_results, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE
+        ):
+            bx1, by1, bx2, by2 = det["box"]
+            if scale != 1.0:
+                bx1, by1, bx2, by2 = [
+                    int(round(v / scale)) for v in (bx1, by1, bx2, by2)
+                ]
+            _add_item(
+                {
+                    "box": _shift_box([bx1, by1, bx2, by2], ox, oy),
+                    "label": det["label"],
+                    "confidence": det["confidence"],
+                },
+                BOOTS_ITEM_LABELS,
+            )
 
-    # Gloves / goggles on the full frame (same settings as glovesgoogle.py)
-    with _inference_lock:
-        boots_kwargs = {
-            "source": frame,
-            "imgsz": BOOTS_INPUT_SIZE,
-            "conf": BOOTS_ITEM_CONFIDENCE,
-            "verbose": False,
-        }
-        if boots_ids:
-            boots_kwargs["classes"] = boots_ids
-        boots_results = boots_model.predict(**boots_kwargs)
+    # 1) Full frame — catch hands just outside a tight person box
+    _predict_source(frame)
 
-    for det in _collect_detections(
-        boots_results, boots_model, BOOTS_CLASSES, min_conf=BOOTS_ITEM_CONFIDENCE
-    ):
-        _add_item(det, BOOTS_ITEM_LABELS)
+    # 2) Wide / hand-focused crops (helps small distant people)
+    for person_box in person_boxes:
+        px1, py1, px2, py2 = person_box
+        ph = max(1, py2 - py1)
+        pw = max(1, px2 - px1)
+        # Full body with wide pad, plus lower hand band (wider than tall body)
+        regions = [
+            _expand_box(person_box, frame.shape, 1.0),
+            [
+                max(0, px1 - int(pw * 1.5)),
+                max(0, py1 + int(ph * 0.25)),
+                min(frame.shape[1], px2 + int(pw * 1.5)),
+                min(frame.shape[0], py2 + int(ph * 0.35)),
+            ],
+        ]
+        for x1, y1, x2, y2 in regions:
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0 or crop.shape[0] < 16 or crop.shape[1] < 16:
+                continue
+            ch, cw = crop.shape[:2]
+            scale = 1.0
+            target_min = 480
+            min_side = min(ch, cw)
+            if min_side < target_min:
+                scale = target_min / float(min_side)
+                crop = cv2.resize(
+                    crop,
+                    (max(32, int(cw * scale)), max(32, int(ch * scale))),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+            _predict_source(crop, ox=x1, oy=y1, scale=scale)
 
     return items
 
@@ -414,7 +467,7 @@ def _item_belongs_to_person(item_box, person_box):
     return containment_ratio(item_box, person_box) >= ITEM_CONTAINMENT_THRESHOLD
 
 
-def _filter_boots_to_persons(boots_items, person_detections):
+def _filter_boots_to_persons(boots_items, person_detections, frame_shape=None):
     """Keep glove/goggle hits only when they belong to a real Person box."""
     if not person_detections or not boots_items:
         return []
@@ -424,10 +477,15 @@ def _filter_boots_to_persons(boots_items, person_detections):
         if item["label"] not in BOOTS_ITEM_LABELS:
             filtered.append(item)
             continue
-        if any(
-            _item_belongs_to_person(item["box"], person["box"])
-            for person in person_detections
-        ):
+        matched = False
+        for person in person_detections:
+            person_box = person["box"]
+            if frame_shape is not None:
+                person_box = _expand_box(person_box, frame_shape, BOOTS_ASSOC_PAD)
+            if _item_belongs_to_person(item["box"], person_box):
+                matched = True
+                break
+        if matched:
             filtered.append(item)
     return filtered
 
@@ -441,16 +499,20 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
     """
     if frame_shape is not None:
         assoc_box = _expand_box(person_box, frame_shape, PERSON_ASSOC_PAD)
+        boots_assoc_box = _expand_box(person_box, frame_shape, BOOTS_ASSOC_PAD)
     else:
         assoc_box = person_box
+        boots_assoc_box = person_box
 
     # Best confidence per canonical label for this person
     best_conf = {}
     matched_items = []
     for item in item_detections:
-        if not _item_belongs_to_person(item["box"], assoc_box):
-            continue
         label = item["label"]
+        # Hands often sit beside/below the body — use a wider pad for gloves/goggles
+        use_box = boots_assoc_box if label in BOOTS_ITEM_LABELS else assoc_box
+        if not _item_belongs_to_person(item["box"], use_box):
+            continue
         matched_items.append(item)
         conf = float(item.get("confidence") or 0.0)
         if conf > best_conf.get(label, 0.0):
@@ -684,7 +746,9 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         boots_items = detect_ppe_for_persons(
             frame, [person["box"] for person in person_detections]
         )
-        boots_items = _filter_boots_to_persons(boots_items, person_detections)
+        boots_items = _filter_boots_to_persons(
+            boots_items, person_detections, frame_shape=frame.shape
+        )
     else:
         boots_items = []
 
