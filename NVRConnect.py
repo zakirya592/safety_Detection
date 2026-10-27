@@ -128,8 +128,12 @@ def _canon_item_label(label):
     return _LABEL_CANON.get(_norm_label(label))
 
 
-# Confidence threshold for Person class only
-PERSON_CONFIDENCE_THRESHOLD = 0.60
+# Confidence threshold for Person class only.
+# Two-worker scene scores ~0.32–0.57; keep those, reject skinny railing FPs via shape.
+PERSON_CONFIDENCE_THRESHOLD = 0.30
+# Drop tall thin posts/railings mislabeled as Person (real distant people can be ~45–70px wide).
+PERSON_MIN_WIDTH = 40
+PERSON_MAX_ASPECT = 3.0  # height / width — railings are often skinnier than this
 
 ITEM_CONTAINMENT_THRESHOLD = 0.20
 PERSON_ASSOC_PAD = 0.45
@@ -145,7 +149,9 @@ BOOTS_ITEM_CONFIDENCE = 0.05
 BOOTS_ASSOC_PAD = 1.20
 # A close person whose head is in frame, with no Hardhat class from v3.2.
 # This camera view does not make the model emit NO-Hardhat on its own.
+# Only invent NO-Hardhat for stronger person scores (avoids railing FPs).
 HEAD_VISIBLE_MIN_HEIGHT = 160
+INFER_NO_HELMET_MIN_PERSON_CONF = 0.65
 HELMET_LABELS = {"Hardhat", "NO-Hardhat"}
 
 MAX_MISSING_FRAMES = 1
@@ -179,6 +185,27 @@ def _label_for(model, class_id, class_map):
     return class_map.get(class_id, str(class_id))
 
 
+def _is_plausible_person_box(box, confidence=1.0):
+    """
+    Reject skinny vertical railings/posts mistaken for people.
+    Weak scores (<0.50) use a stricter aspect/width rule.
+    """
+    x1, y1, x2, y2 = box
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return False
+    aspect = h / float(w)
+    if confidence < 0.50:
+        # Railing FPs often land ~0.40–0.45 with tall thin boxes
+        if w < 75 or aspect > 2.55:
+            return False
+    else:
+        if w < PERSON_MIN_WIDTH or aspect > PERSON_MAX_ASPECT:
+            return False
+    return True
+
+
 def _collect_detections(results, model, class_map, min_conf=0.0, person_min_conf=PERSON_CONFIDENCE_THRESHOLD):
     detections = []
     for result in results:
@@ -195,6 +222,10 @@ def _collect_detections(results, model, class_map, min_conf=0.0, person_min_conf
                 continue
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             if x2 <= x1 or y2 <= y1:
+                continue
+            if _is_person_label(label) and not _is_plausible_person_box(
+                [x1, y1, x2, y2], confidence
+            ):
                 continue
             detections.append({
                 "box": [x1, y1, x2, y2],
@@ -449,6 +480,8 @@ def _persons_from_ppe_items(items, frame_shape):
             box = _person_box_from_head(det["box"], frame_shape)
         else:
             box = _expand_box(det["box"], frame_shape, 0.45)
+        if not _is_plausible_person_box(box, float(det["confidence"])):
+            continue
         persons.append({
             "box": box,
             "label": "Person",
@@ -490,7 +523,7 @@ def _filter_boots_to_persons(boots_items, person_detections, frame_shape=None):
     return filtered
 
 
-def classify_person_ppe(person_box, item_detections, frame_shape=None):
+def classify_person_ppe(person_box, item_detections, frame_shape=None, person_confidence=1.0):
     """
     Build ONE status for the person box.
 
@@ -519,9 +552,13 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
             best_conf[label] = conf
 
     # v3.2 often returns only Person on this overhead view. A close, fully
-    # visible head with no Hardhat box is a missing helmet.
+    # visible head with no Hardhat box is a missing helmet — only for strong persons.
     px1, py1, px2, py2 = person_box
-    if (py2 - py1) >= HEAD_VISIBLE_MIN_HEIGHT and py1 > 4:
+    if (
+        person_confidence >= INFER_NO_HELMET_MIN_PERSON_CONF
+        and (py2 - py1) >= HEAD_VISIBLE_MIN_HEIGHT
+        and py1 > 4
+    ):
         if "Hardhat" not in best_conf and "NO-Hardhat" not in best_conf:
             best_conf["NO-Hardhat"] = 0.0
 
@@ -548,9 +585,18 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
     neg_found = [lab for lab in neg_order if lab in best_conf]
     pos_found = [lab for lab in pos_order if lab in best_conf]
 
+    # Box text shows only missing/"No" items (never worn Helmet/vest/glove).
     display_names = {
+        "NO-Hardhat": "NO-Hardhat",
+        "NO-Safety Vest": "NO-Safety Vest",
+        "NO-Mask": "NO-Mask",
+        "no_glove": "no_glove",
+        "no_goggles": "no_goggles",
         "Hardhat": "Helmet",
-        "NO-Hardhat": "No Helmet",
+        "Safety Vest": "Safety Vest",
+        "Mask": "Mask",
+        "glove": "glove",
+        "goggles": "goggles",
     }
 
     def _with_score(lab):
@@ -563,12 +609,13 @@ def classify_person_ppe(person_box, item_detections, frame_shape=None):
     is_violation = len(neg_found) > 0
     missing_items = list(neg_found)
 
-    # Keep the PPE class names on the box. A glove violation must not hide Hardhat.
-    parts = [_with_score(lab) for lab in neg_found + pos_found]
     if is_violation:
-        label_text = ", ".join(parts) if parts else "NO-PPE"
+        # e.g. "no_glove 0.09 + NO-Hardhat" — negatives only
+        parts = [_with_score(lab) for lab in neg_found]
+        label_text = " + ".join(parts) if parts else "NO-PPE"
     else:
-        label_text = " | ".join(["Person"] + parts)
+        parts = [_with_score(lab) for lab in pos_found]
+        label_text = " | ".join(["Person"] + parts) if parts else "Person"
 
     return {
         "Hardhat": "missing" if "NO-Hardhat" in best_conf else ("present" if "Hardhat" in best_conf else "unknown"),
@@ -770,7 +817,10 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     detected_persons = []
     for person in person_detections:
         status = classify_person_ppe(
-            person["box"], item_detections, frame_shape=frame.shape
+            person["box"],
+            item_detections,
+            frame_shape=frame.shape,
+            person_confidence=float(person.get("confidence") or 0.0),
         )
         detected_persons.append({
             "box": person["box"],
