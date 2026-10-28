@@ -185,9 +185,13 @@ def _label_for(model, class_id, class_map):
     return class_map.get(class_id, str(class_id))
 
 
+# Glove/goggle alarms only for stronger Person scores (blocks pedestal/machinery FPs ~0.39).
+MIN_PERSON_CONF_FOR_BOOTS_ALARM = 0.45
+
+
 def _is_plausible_person_box(box, confidence=1.0):
     """
-    Reject skinny vertical railings/posts mistaken for people.
+    Reject skinny vertical railings/posts / machine stands mistaken for people.
     Weak scores (<0.50) use a stricter aspect/width rule.
     """
     x1, y1, x2, y2 = box
@@ -197,8 +201,8 @@ def _is_plausible_person_box(box, confidence=1.0):
         return False
     aspect = h / float(w)
     if confidence < 0.50:
-        # Railing FPs often land ~0.40–0.45 with tall thin boxes
-        if w < 75 or aspect > 2.55:
+        # Pedestal/machinery FPs ~0.39 often have aspect ~2.0+; real weak people ~1.5
+        if w < 75 or aspect > 1.85:
             return False
     else:
         if w < PERSON_MIN_WIDTH or aspect > PERSON_MAX_ASPECT:
@@ -836,6 +840,13 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         # Missing helmet: alarm only under the name NO-Hardhat.
         if status.get("Hardhat") == "present":
             alarm_labels = [lab for lab in alarm_labels if lab != "NO-Hardhat"]
+        # Weak false "persons" (machinery) must not trigger glove/goggle screenshots
+        person_conf = float(person.get("confidence") or 0.0)
+        if person_conf < MIN_PERSON_CONF_FOR_BOOTS_ALARM:
+            alarm_labels = [
+                lab for lab in alarm_labels
+                if lab not in ("no_glove", "no_goggles")
+            ]
         if alarm_labels:
             violating_persons.append({
                 "label": ", ".join(alarm_labels),
