@@ -110,6 +110,8 @@ PPE_ITEM_CONFIDENCE = 0.25
 BOOTS_ITEM_CONFIDENCE = 0.05
 # Extra pad when linking glove/goggle boxes to a person (hands sit beside/below body).
 BOOTS_ASSOC_PAD = 1.20
+# Glove/goggle alarms only for stronger Person scores (blocks pedestal/machinery FPs ~0.39).
+MIN_PERSON_CONF_FOR_BOOTS_ALARM = 0.45
 
 # A missing helmet counts only when no_helmet is at least this confident
 # and stronger than the best Hardhat on the same person.
@@ -208,7 +210,7 @@ def _label_for(model, class_id, class_map):
 
 def _is_plausible_person_box(box, confidence=1.0):
     """
-    Reject skinny vertical railings/posts mistaken for people.
+    Reject skinny vertical railings/posts / machine stands mistaken for people.
     Weak scores (<0.50) use a stricter aspect/width rule.
     """
     x1, y1, x2, y2 = box
@@ -218,8 +220,8 @@ def _is_plausible_person_box(box, confidence=1.0):
         return False
     aspect = h / float(w)
     if confidence < 0.50:
-        # Railing FPs often land ~0.40–0.45 with tall thin boxes
-        if w < 75 or aspect > 2.55:
+        # Pedestal/machinery FPs ~0.39 often have aspect ~2.0+; real weak people ~1.5
+        if w < 75 or aspect > 1.85:
             return False
     else:
         if w < PERSON_MIN_WIDTH or aspect > PERSON_MAX_ASPECT:
@@ -839,6 +841,13 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         if track["missing_frames"] != 0:
             continue
         confirmed = _confirmed_missing_items(track["status"], track["helmet_miss_streak"])
+        # Weak false "persons" (machinery) must not trigger glove/goggle screenshots
+        person_conf = float(track.get("confidence") or 0.0)
+        if person_conf < MIN_PERSON_CONF_FOR_BOOTS_ALARM:
+            confirmed = [
+                item for item in confirmed
+                if item.get("item") not in ("gloves", "goggles")
+            ]
         if not confirmed:
             continue
         box = track["box"]
