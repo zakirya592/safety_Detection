@@ -220,6 +220,75 @@ def fetch_snapshot_jpeg(ip, camera_id):
     return None
 
 
+def set_optical_zoom(ip, camera_id, zoom_percent=100):
+    """
+    Set UniFi Protect optical zoom (0–100%).
+
+    100 ≈ full optical zoom (e.g. 3x on cameras that support it).
+    Uses ispSettings.zoomPosition (same as Protect Zoom Mode → Optical).
+    Returns True on success.
+    """
+    if not ip or not camera_id:
+        return False
+    level = max(0, min(100, int(zoom_percent)))
+    body = {"ispSettings": {"zoomPosition": level}}
+    url = f"https://{ip}/proxy/protect/api/cameras/{camera_id}"
+
+    for attempt in range(2):
+        session = get_session(ip)
+        status, payload, _, csrf, err, _ = _request(
+            url,
+            method="PATCH",
+            body=body,
+            cookies=session["cookies"],
+            csrf=session["csrf"],
+            timeout=15,
+        )
+        session["csrf"] = csrf or session["csrf"]
+        if status == 200:
+            print(f"Optical zoom set to {level}% on camera {str(camera_id)[:8]}…")
+            return True
+        if status in (401, 403) and attempt == 0:
+            refresh_session(ip)
+            continue
+        print(
+            f"Optical zoom failed on {ip} camera {str(camera_id)[:8]}… "
+            f"(HTTP {status}): {err or payload}"
+        )
+        return False
+    return False
+
+
+def capture_optically_zoomed_snapshot(
+    ip,
+    camera_id,
+    zoom_percent=100,
+    settle_seconds=2.5,
+    restore_zoom=0,
+):
+    """
+    Lens-zoom the camera, wait for settle, grab a Protect snapshot, then restore zoom.
+
+    Returns JPEG bytes or None. Caller should fall back to digital crop if None.
+    """
+    if not ip or not camera_id:
+        return None
+
+    zoomed = False
+    try:
+        zoomed = set_optical_zoom(ip, camera_id, zoom_percent)
+        if not zoomed:
+            return None
+        time.sleep(max(0.5, float(settle_seconds)))
+        return fetch_snapshot_jpeg(ip, camera_id)
+    finally:
+        if zoomed and restore_zoom is not None:
+            try:
+                set_optical_zoom(ip, camera_id, restore_zoom)
+            except Exception as exc:
+                print(f"Failed to restore optical zoom: {exc}")
+
+
 def fetch_bootstrap(ip, cookies, csrf):
     status, payload, cookies, csrf, err, _ = _request(
         f"https://{ip}/proxy/protect/api/bootstrap",

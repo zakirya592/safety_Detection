@@ -733,6 +733,7 @@ from nvr_config import (
 )
 
 CAMERA_LOCATIONS = {config["name"]: config.get("location", "Unknown") for config in CAMERA_CONFIGS}
+CAMERA_BY_NAME = {config["name"]: config for config in CAMERA_CONFIGS}
 
 
 def draw_person_box(annotated, box, status, confidence, track_id=None):
@@ -859,8 +860,14 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
     if violating_persons:
         alarm.play()
         print(f"Violations: {[p['label'] for p in violating_persons]}")
+        cam_cfg = CAMERA_BY_NAME.get(camera_name) or {}
         screenshot_result = screenshot_manager.take_screenshot(
-            frame, violating_persons, camera_name=camera_name
+            frame,
+            violating_persons,
+            camera_name=camera_name,
+            nvr_ip=cam_cfg.get("nvr_ip") or cam_cfg.get("ip"),
+            protect_id=cam_cfg.get("protect_id"),
+            use_optical_zoom=True,
         )
         if screenshot_result:
             print(f"Screenshot saved: {screenshot_result['path']}")
