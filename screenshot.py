@@ -13,13 +13,16 @@ class ScreenshotManager:
         upload_to_cloudinary=True,
         cloudinary_uploader=None,
         zoom_pad_ratio=0.40,
-        zoom_out_size=720,
+        # Cap longest side when cropping; never upscale small boxes (that causes blur).
+        max_crop_side=1920,
+        jpeg_quality=98,
     ):
         self.screenshots_dir = screenshots_dir
         self.reset_time_seconds = reset_time_seconds  # Reset photographed persons after this many seconds
         self.photographed_persons = []  # List of dicts with person info and timestamp
         self.zoom_pad_ratio = zoom_pad_ratio
-        self.zoom_out_size = zoom_out_size
+        self.max_crop_side = max_crop_side
+        self.jpeg_quality = jpeg_quality
         self.cloudinary_uploader = (
             cloudinary_uploader
             if cloudinary_uploader is not None
@@ -44,8 +47,8 @@ class ScreenshotManager:
 
     def _zoom_violation_crop(self, frame, persons):
         """
-        Zoom into violating person(s): pad the box, crop, then enlarge.
-        Uses a union box when several people violate in the same frame.
+        Pad + crop violating person(s) at native resolution.
+        Only downscale if the crop is huge — never upscale (avoids blur).
         """
         h, w = frame.shape[:2]
         x1 = min(int(p["x1"]) for p in persons)
@@ -63,31 +66,33 @@ class ScreenshotManager:
         x2 = min(w, x2 + pad_x)
         y2 = min(h, y2 + pad_y)
 
-        crop = frame[y1:y2, x1:x2]
+        crop = frame[y1:y2, x1:x2].copy()
         if crop.size == 0:
             return frame.copy()
 
-        # Keep aspect ratio; fit longest side to zoom_out_size
         ch, cw = crop.shape[:2]
-        scale = float(self.zoom_out_size) / float(max(ch, cw))
-        new_w = max(1, int(round(cw * scale)))
-        new_h = max(1, int(round(ch * scale)))
-        zoomed = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        scale = 1.0
+        max_side = max(ch, cw)
+        if max_side > self.max_crop_side:
+            scale = float(self.max_crop_side) / float(max_side)
+            new_w = max(1, int(round(cw * scale)))
+            new_h = max(1, int(round(ch * scale)))
+            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        # Remap person boxes into zoomed crop coords and draw labels
+        # Remap person boxes into crop coords and draw labels
         for person_info in persons:
             px1 = int((int(person_info["x1"]) - x1) * scale)
             py1 = int((int(person_info["y1"]) - y1) * scale)
             px2 = int((int(person_info["x2"]) - x1) * scale)
             py2 = int((int(person_info["y2"]) - y1) * scale)
-            cv2.rectangle(zoomed, (px1, py1), (px2, py2), (0, 0, 255), 2)
+            cv2.rectangle(crop, (px1, py1), (px2, py2), (0, 0, 255), 2)
             shown = (
                 str(person_info["label"])
                 .replace("NO-Hardhat", "No Helmet")
                 .replace("Hardhat", "Helmet")
             )
             cv2.putText(
-                zoomed,
+                crop,
                 f"{shown} {person_info['confidence']:.2f}",
                 (max(5, px1), max(25, py1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -96,7 +101,7 @@ class ScreenshotManager:
                 2,
             )
 
-        return zoomed
+        return crop
 
     def take_screenshot(self, frame, violating_persons, camera_name=None):
         """
@@ -146,10 +151,9 @@ class ScreenshotManager:
         if not new_persons_to_photograph:
             return None
 
-        # Zoom first, then screenshot the zoomed person crop
+        # Native-resolution crop (no upscale blur), then high-quality JPEG
         screenshot_frame = self._zoom_violation_crop(frame, new_persons_to_photograph)
 
-        # Save screenshot
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         violations_str = "_".join(
             str(p["label"]).replace(" ", "_").replace("+", "").replace("&", "")
@@ -158,7 +162,11 @@ class ScreenshotManager:
         # Keep filename short / filesystem-safe
         violations_str = "".join(c if c.isalnum() or c in "_-" else "_" for c in violations_str)[:80]
         screenshot_path = os.path.join(self.screenshots_dir, f"violation_{violations_str}_{timestamp}.jpg")
-        cv2.imwrite(screenshot_path, screenshot_frame)
+        cv2.imwrite(
+            screenshot_path,
+            screenshot_frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)],
+        )
 
         image_url = None
         if self.cloudinary_uploader and self.cloudinary_uploader.enabled:

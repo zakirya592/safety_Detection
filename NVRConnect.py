@@ -107,7 +107,7 @@ PPE_INPUT_SIZE = 640
 BOOTS_INPUT_SIZE = 960
 PPE_ITEM_CONFIDENCE = 0.25
 # Distant hands often score ~0.05–0.08; keep low but only after person association.
-BOOTS_ITEM_CONFIDENCE = 0.05
+BOOTS_ITEM_CONFIDENCE = 0.21
 # Extra pad when linking glove/goggle boxes to a person (hands sit beside/below body).
 BOOTS_ASSOC_PAD = 1.20
 # Glove/goggle alarms only for stronger Person scores (blocks pedestal/machinery FPs ~0.39).
