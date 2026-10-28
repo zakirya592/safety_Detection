@@ -88,8 +88,12 @@ GOGGLES_NEGATIVE = {"no_goggles", "no_goggle"}
 ITEM_LABELS = HELMET_POSITIVE | HELMET_NEGATIVE | VEST_POSITIVE | VEST_NEGATIVE | GLOVE_POSITIVE | GLOVE_NEGATIVE | GOGGLES_POSITIVE | GOGGLES_NEGATIVE
 
 
-# Confidence threshold for Person class only (ZakiryaNVR: 0.60 cuts weak FPs)
-PERSON_CONFIDENCE_THRESHOLD = 0.60
+# Confidence threshold for Person class only.
+# Two-worker scene scores ~0.32–0.57; keep those, reject skinny railing FPs via shape.
+PERSON_CONFIDENCE_THRESHOLD = 0.30
+# Drop tall thin posts/railings mislabeled as Person (real distant people can be ~45–70px wide).
+PERSON_MIN_WIDTH = 40
+PERSON_MAX_ASPECT = 3.0  # height / width — railings are often skinnier than this
 
 # Fraction of an item's own box area that must fall inside a person's box
 # for that item to be considered "worn by" that person.
@@ -202,6 +206,27 @@ def _label_for(model, class_id, class_map):
     return _canon_item_label(raw) or raw
 
 
+def _is_plausible_person_box(box, confidence=1.0):
+    """
+    Reject skinny vertical railings/posts mistaken for people.
+    Weak scores (<0.50) use a stricter aspect/width rule.
+    """
+    x1, y1, x2, y2 = box
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return False
+    aspect = h / float(w)
+    if confidence < 0.50:
+        # Railing FPs often land ~0.40–0.45 with tall thin boxes
+        if w < 75 or aspect > 2.55:
+            return False
+    else:
+        if w < PERSON_MIN_WIDTH or aspect > PERSON_MAX_ASPECT:
+            return False
+    return True
+
+
 def _collect_detections(results, model, class_map, min_conf=0.0, person_min_conf=PERSON_CONFIDENCE_THRESHOLD):
     detections = []
     for result in results:
@@ -218,6 +243,10 @@ def _collect_detections(results, model, class_map, min_conf=0.0, person_min_conf
                 continue
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             if x2 <= x1 or y2 <= y1:
+                continue
+            if _is_person_label(label) and not _is_plausible_person_box(
+                [x1, y1, x2, y2], confidence
+            ):
                 continue
             detections.append({
                 "box": [x1, y1, x2, y2],
