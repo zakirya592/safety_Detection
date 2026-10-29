@@ -196,7 +196,7 @@ def _capture_loop(cap, name, camera_id):
             time.sleep(0.25)
 
 
-def _process_loop(name, camera_id):
+def _process_loop(name, camera_id, camera_config=None):
     """Slower loop: run PPE detection without blocking the live stream."""
     frame_counter = 0
     person_tracker = PersonTracker()
@@ -210,7 +210,9 @@ def _process_loop(name, camera_id):
             continue
 
         frame_counter += 1
-        processed = process_frame(raw, name, frame_counter, person_tracker)
+        processed = process_frame(
+            raw, name, frame_counter, person_tracker, camera_config=camera_config
+        )
         _set_display_frame(camera_id, processed)
         time.sleep(0.05)
 
@@ -220,7 +222,7 @@ def _start_single_camera(config, camera_id):
         if config.get("run_model", True):
             threading.Thread(
                 target=_process_loop,
-                args=(config["name"], camera_id),
+                args=(config["name"], camera_id, config),
                 daemon=True,
                 name=f"process-{camera_id}",
             ).start()

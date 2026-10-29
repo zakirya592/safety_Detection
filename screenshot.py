@@ -12,9 +12,9 @@ class ScreenshotManager:
         reset_time_seconds=30,
         upload_to_cloudinary=True,
         cloudinary_uploader=None,
-        zoom_pad_ratio=0.40,
-        # Cap longest side when cropping; never upscale small boxes (that causes blur).
-        max_crop_side=1920,
+        zoom_pad_ratio=0.35,
+        # Keep up to full 4K crop. Never upscale (that causes blur).
+        max_crop_side=3840,
         jpeg_quality=98,
     ):
         self.screenshots_dir = screenshots_dir
@@ -45,10 +45,28 @@ class ScreenshotManager:
         text = str(label or "").replace("|", ",").replace(" + ", ",").replace(" & ", ",")
         return [p.strip() for p in text.split(",") if p.strip()]
 
+    def _scale_persons(self, persons, src_shape, dst_shape):
+        """Map detection boxes from src frame size onto dst (e.g. 4K snapshot)."""
+        sh, sw = src_shape[:2]
+        dh, dw = dst_shape[:2]
+        if sh <= 0 or sw <= 0 or (sh == dh and sw == dw):
+            return [p.copy() for p in persons]
+        sx = dw / float(sw)
+        sy = dh / float(sh)
+        out = []
+        for person in persons:
+            scaled = person.copy()
+            scaled["x1"] = int(round(person["x1"] * sx))
+            scaled["y1"] = int(round(person["y1"] * sy))
+            scaled["x2"] = int(round(person["x2"] * sx))
+            scaled["y2"] = int(round(person["y2"] * sy))
+            out.append(scaled)
+        return out
+
     def _zoom_violation_crop(self, frame, persons):
         """
-        Pad + crop violating person(s) at native resolution.
-        Only downscale if the crop is huge — never upscale (avoids blur).
+        Pad + crop violating person(s) at native resolution (up to 4K).
+        Only downscale if the crop is larger than max_crop_side — never upscale.
         """
         h, w = frame.shape[:2]
         x1 = min(int(p["x1"]) for p in persons)
@@ -85,7 +103,9 @@ class ScreenshotManager:
             py1 = int((int(person_info["y1"]) - y1) * scale)
             px2 = int((int(person_info["x2"]) - x1) * scale)
             py2 = int((int(person_info["y2"]) - y1) * scale)
-            cv2.rectangle(crop, (px1, py1), (px2, py2), (0, 0, 255), 2)
+            thickness = 2 if max(ch, cw) < 1600 else 3
+            font_scale = 0.7 if max(ch, cw) < 1600 else 1.1
+            cv2.rectangle(crop, (px1, py1), (px2, py2), (0, 0, 255), thickness)
             shown = (
                 str(person_info["label"])
                 .replace("NO-Hardhat", "No Helmet")
@@ -94,23 +114,25 @@ class ScreenshotManager:
             cv2.putText(
                 crop,
                 f"{shown} {person_info['confidence']:.2f}",
-                (max(5, px1), max(25, py1 - 8)),
+                (max(5, px1), max(30, py1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                font_scale,
                 (0, 0, 255),
-                2,
+                thickness,
             )
 
         return crop
 
-    def take_screenshot(self, frame, violating_persons, camera_name=None):
+    def take_screenshot(self, frame, violating_persons, camera_name=None, source_frame=None):
         """
-        Zoom onto the violating person(s), then save that cropped screenshot.
+        Crop the violating person(s) and save a high-quality JPEG.
 
         Args:
-            frame: The original video frame
-            violating_persons: List of dictionaries containing violation info (label, x1, y1, x2, y2, confidence)
+            frame: Detection frame (box coordinates are in this space; used for dedup)
+            violating_persons: Violation dicts with label, x1, y1, x2, y2, confidence
             camera_name: Optional camera name included in Cloudinary metadata
+            source_frame: Optional higher-res image (Protect 4K snapshot). Boxes are
+                scaled from `frame` onto this image before cropping.
 
         Returns:
             dict with path/image_url/persons, or None if no new persons to photograph
@@ -151,8 +173,23 @@ class ScreenshotManager:
         if not new_persons_to_photograph:
             return None
 
-        # Native-resolution crop (no upscale blur), then high-quality JPEG
-        screenshot_frame = self._zoom_violation_crop(frame, new_persons_to_photograph)
+        # Prefer 4K Protect snapshot when provided; keep detection boxes for dedup only
+        crop_src = source_frame if source_frame is not None else frame
+        persons_for_crop = new_persons_to_photograph
+        if (
+            source_frame is not None
+            and source_frame is not frame
+            and source_frame.shape[:2] != frame.shape[:2]
+        ):
+            persons_for_crop = self._scale_persons(
+                new_persons_to_photograph, frame.shape, source_frame.shape
+            )
+            print(
+                f"4K crop source: {source_frame.shape[1]}x{source_frame.shape[0]} "
+                f"(detect {frame.shape[1]}x{frame.shape[0]})"
+            )
+
+        screenshot_frame = self._zoom_violation_crop(crop_src, persons_for_crop)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         violations_str = "_".join(
@@ -177,7 +214,7 @@ class ScreenshotManager:
             )
             upload_result = self.cloudinary_uploader.upload(
                 screenshot_path,
-                tags=["safety-violation", "ppe-detection", "zoomed"],
+                tags=["safety-violation", "ppe-detection", "4k-crop"],
                 context=context,
             )
             if upload_result:
@@ -185,6 +222,7 @@ class ScreenshotManager:
                 print(f"Cloudinary upload complete: {image_url}")
 
         # Mark these persons as photographed with current timestamp
+        # (always detection-frame coords so overlap checks stay correct)
         current_time = datetime.now()
         for person_info in new_persons_to_photograph:
             person_with_timestamp = person_info.copy()

@@ -791,12 +791,31 @@ def draw_person_box(annotated, box, status, confidence, track_id=None):
     return width, height
 
 
-def process_frame(frame, camera_name, frame_count, person_tracker):
+def _fetch_4k_snapshot_frame(camera_config):
+    """
+    Pull a fresh Protect JPEG (usually full 4K) for violation crops.
+    Detection can stay on the live RTSP stream; screenshots use this.
+    """
+    if not camera_config:
+        return None
+    protect_id = camera_config.get("protect_id")
+    nvr_ip = camera_config.get("nvr_ip") or camera_config.get("ip")
+    if not protect_id or not nvr_ip:
+        return None
+    jpeg = fetch_snapshot_jpeg(nvr_ip, protect_id)
+    if not jpeg:
+        return None
+    hires = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return hires
+
+
+def process_frame(frame, camera_name, frame_count, person_tracker, camera_config=None):
     """
     Person-first pipeline:
       1. Detect people with the PPE model (the only model that has Person).
       2. If nobody is found, skip PPE and keep waiting.
       3. If a person is found, run helmet/vest/gloves/goggles on that person only.
+      4. On violation: crop from a Protect 4K snapshot when available.
     """
     annotated = frame
 
@@ -862,8 +881,13 @@ def process_frame(frame, camera_name, frame_count, person_tracker):
         alarm.play()
         print(f"Violations detected: {[p['label'] for p in violating_persons]}")
         print(f"Violating persons count: {len(violating_persons)}")
+        # Live stream may be low/medium RTSP; crop from Protect 4K snapshot when possible
+        hires = _fetch_4k_snapshot_frame(camera_config)
         screenshot_result = screenshot_manager.take_screenshot(
-            frame, violating_persons, camera_name=camera_name
+            frame,
+            violating_persons,
+            camera_name=camera_name,
+            source_frame=hires,
         )
         if screenshot_result:
             print(f"Screenshot saved: {screenshot_result['path']}")
@@ -951,7 +975,8 @@ def camera_worker(config):
                 frame,
                 camera_name,
                 frame_counter,
-                tracker
+                tracker,
+                camera_config=config,
             )
         else:
             processed = frame
