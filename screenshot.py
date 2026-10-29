@@ -1,170 +1,124 @@
 import cv2
 import os
-import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from cloudinary_uploader import CloudinaryUploader
 
 
 class ScreenshotManager:
-    """
-    Violation screenshots: ZOOM first (3x optical), then FULL FRAME screenshot.
-    No digital crop of the person box.
-    """
-
     def __init__(
         self,
         screenshots_dir="screenshots",
         reset_time_seconds=30,
         upload_to_cloudinary=True,
         cloudinary_uploader=None,
+        zoom_pad_ratio=0.40,
+        # Cap longest side when cropping; never upscale small boxes (that causes blur).
+        max_crop_side=1920,
         jpeg_quality=98,
-        # 100% ≈ full optical zoom (3x on UniFi cameras that support it)
-        optical_zoom_percent=100,
-        optical_zoom_settle_seconds=2.5,
     ):
         self.screenshots_dir = screenshots_dir
-        self.reset_time_seconds = reset_time_seconds
-        self.photographed_persons = []
+        self.reset_time_seconds = reset_time_seconds  # Reset photographed persons after this many seconds
+        self.photographed_persons = []  # List of dicts with person info and timestamp
+        self.zoom_pad_ratio = zoom_pad_ratio
+        self.max_crop_side = max_crop_side
         self.jpeg_quality = jpeg_quality
-        self.optical_zoom_percent = optical_zoom_percent
-        self.optical_zoom_settle_seconds = optical_zoom_settle_seconds
         self.cloudinary_uploader = (
             cloudinary_uploader
             if cloudinary_uploader is not None
             else (CloudinaryUploader() if upload_to_cloudinary else None)
         )
 
+        # Create screenshots directory
         if not os.path.exists(screenshots_dir):
             os.makedirs(screenshots_dir)
 
     def _clean_old_photographed_persons(self):
+        """Remove photographed persons that are older than reset_time_seconds"""
         current_time = datetime.now()
         self.photographed_persons = [
             person for person in self.photographed_persons
-            if (current_time - person["timestamp"]).total_seconds() < self.reset_time_seconds
+            if (current_time - person['timestamp']).total_seconds() < self.reset_time_seconds
         ]
 
     def _alarm_parts(self, label):
         text = str(label or "").replace("|", ",").replace(" + ", ",").replace(" & ", ",")
         return [p.strip() for p in text.split(",") if p.strip()]
 
-    def _draw_full_frame_labels(self, frame, persons, banner_prefix="PPE"):
-        """Annotate the FULL frame (no crop). Boxes only when coords match this frame."""
-        out = frame.copy()
-        labels = []
+    def _zoom_violation_crop(self, frame, persons):
+        """
+        Pad + crop violating person(s) at native resolution.
+        Only downscale if the crop is huge — never upscale (avoids blur).
+        """
+        h, w = frame.shape[:2]
+        x1 = min(int(p["x1"]) for p in persons)
+        y1 = min(int(p["y1"]) for p in persons)
+        x2 = max(int(p["x2"]) for p in persons)
+        y2 = max(int(p["y2"]) for p in persons)
+
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        pad_x = int(bw * self.zoom_pad_ratio)
+        pad_y = int(bh * self.zoom_pad_ratio)
+
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(w, x2 + pad_x)
+        y2 = min(h, y2 + pad_y)
+
+        crop = frame[y1:y2, x1:x2].copy()
+        if crop.size == 0:
+            return frame.copy()
+
+        ch, cw = crop.shape[:2]
+        scale = 1.0
+        max_side = max(ch, cw)
+        if max_side > self.max_crop_side:
+            scale = float(self.max_crop_side) / float(max_side)
+            new_w = max(1, int(round(cw * scale)))
+            new_h = max(1, int(round(ch * scale)))
+            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # Remap person boxes into crop coords and draw labels
         for person_info in persons:
+            px1 = int((int(person_info["x1"]) - x1) * scale)
+            py1 = int((int(person_info["y1"]) - y1) * scale)
+            px2 = int((int(person_info["x2"]) - x1) * scale)
+            py2 = int((int(person_info["y2"]) - y1) * scale)
+            cv2.rectangle(crop, (px1, py1), (px2, py2), (0, 0, 255), 2)
             shown = (
                 str(person_info["label"])
                 .replace("NO-Hardhat", "No Helmet")
                 .replace("Hardhat", "Helmet")
             )
-            conf = float(person_info.get("confidence") or 0)
-            labels.append(f"{shown} {conf:.2f}")
-
-            # Draw box only if it fits this frame (live fallback). After optical
-            # zoom, wide-view boxes no longer match — skip drawing them.
-            try:
-                x1 = int(person_info["x1"])
-                y1 = int(person_info["y1"])
-                x2 = int(person_info["x2"])
-                y2 = int(person_info["y2"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            h, w = out.shape[:2]
-            if 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h:
-                cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                cv2.putText(
-                    out,
-                    f"{shown} {conf:.2f}",
-                    (max(5, x1), max(28, y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2,
-                )
-
-        text = " | ".join(labels) if labels else "PPE Violation"
-        cv2.rectangle(out, (0, 0), (out.shape[1], 48), (0, 0, 0), -1)
-        cv2.putText(
-            out,
-            f"{banner_prefix} | {text}",
-            (12, 32),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2,
-        )
-        return out
-
-    def _try_optical_zoom_full_screenshot(self, persons, nvr_ip, protect_id):
-        """
-        1) Set 3x optical zoom
-        2) Wait for lens
-        3) Full-frame Protect snapshot (NO crop)
-        4) Restore zoom
-        """
-        try:
-            from unifi_discover import capture_optically_zoomed_snapshot
-        except ImportError:
-            return None
-
-        jpeg = capture_optically_zoomed_snapshot(
-            nvr_ip,
-            protect_id,
-            zoom_percent=self.optical_zoom_percent,
-            settle_seconds=self.optical_zoom_settle_seconds,
-            restore_zoom=0,
-        )
-        if not jpeg:
-            return None
-        arr = np.frombuffer(jpeg, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            return None
-        print(
-            f"Optical zoom FULL screenshot OK ({frame.shape[1]}x{frame.shape[0]}) "
-            f"zoom={self.optical_zoom_percent}%"
-        )
-        # Full zoomed frame only — do not crop; boxes from wide view do not map
-        out = frame.copy()
-        labels = []
-        for person_info in persons:
-            shown = (
-                str(person_info["label"])
-                .replace("NO-Hardhat", "No Helmet")
-                .replace("Hardhat", "Helmet")
+            cv2.putText(
+                crop,
+                f"{shown} {person_info['confidence']:.2f}",
+                (max(5, px1), max(25, py1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
             )
-            labels.append(f"{shown} {float(person_info.get('confidence') or 0):.2f}")
-        text = " | ".join(labels) if labels else "PPE Violation"
-        cv2.rectangle(out, (0, 0), (out.shape[1], 48), (0, 0, 0), -1)
-        cv2.putText(
-            out,
-            f"3x Optical | {text}",
-            (12, 32),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2,
-        )
-        return out
 
-    def take_screenshot(
-        self,
-        frame,
-        violating_persons,
-        camera_name=None,
-        nvr_ip=None,
-        protect_id=None,
-        use_optical_zoom=True,
-    ):
-        """
-        Zoom in (3x optical) → full-frame screenshot. No person crop.
+        return crop
 
-        Fallback (no protect_id / zoom fail): full live frame with boxes, still no crop.
+    def take_screenshot(self, frame, violating_persons, camera_name=None):
         """
+        Zoom onto the violating person(s), then save that cropped screenshot.
+
+        Args:
+            frame: The original video frame
+            violating_persons: List of dictionaries containing violation info (label, x1, y1, x2, y2, confidence)
+            camera_name: Optional camera name included in Cloudinary metadata
+
+        Returns:
+            dict with path/image_url/persons, or None if no new persons to photograph
+        """
+        # Clean old photographed persons (allow re-photographing after reset_time_seconds)
         self._clean_old_photographed_persons()
 
+        # Check if there are any new persons to photograph
         new_persons_to_photograph = []
 
         alarm_labels = {
@@ -175,18 +129,19 @@ class ScreenshotManager:
 
         for person_info in violating_persons:
             parts = self._alarm_parts(person_info.get("label", ""))
+            # Only alarm on missing-gear labels (ignore worn Hardhat / helmet)
             if not any(
                 part in alarm_labels or part.split()[0] in alarm_labels
                 for part in parts
             ):
                 continue
+            # Check if this person was already photographed (similar location)
             is_new_person = True
             for photographed in self.photographed_persons:
-                overlap = (
-                    (min(person_info["x2"], photographed["x2"]) - max(person_info["x1"], photographed["x1"]))
-                    * (min(person_info["y2"], photographed["y2"]) - max(person_info["y1"], photographed["y1"]))
-                )
-                if overlap > 0:
+                # Check if boxes overlap significantly (same person)
+                overlap = (min(person_info['x2'], photographed['x2']) - max(person_info['x1'], photographed['x1'])) * \
+                         (min(person_info['y2'], photographed['y2']) - max(person_info['y1'], photographed['y1']))
+                if overlap > 0:  # If there's any overlap, consider it the same person
                     is_new_person = False
                     break
 
@@ -196,39 +151,17 @@ class ScreenshotManager:
         if not new_persons_to_photograph:
             return None
 
-        screenshot_frame = None
-        zoom_mode = "full"
-
-        # Preferred: lens zoom → full screenshot (not crop)
-        if use_optical_zoom and nvr_ip and protect_id:
-            screenshot_frame = self._try_optical_zoom_full_screenshot(
-                new_persons_to_photograph, nvr_ip, protect_id
-            )
-            if screenshot_frame is not None:
-                zoom_mode = "optical"
-
-        # Fallback: full live frame (still no crop)
-        if screenshot_frame is None:
-            screenshot_frame = self._draw_full_frame_labels(
-                frame, new_persons_to_photograph, banner_prefix="Full frame"
-            )
-            print(
-                "Screenshot: full live frame (optical zoom unavailable — "
-                "need protect_id). No crop."
-            )
+        # Native-resolution crop (no upscale blur), then high-quality JPEG
+        screenshot_frame = self._zoom_violation_crop(frame, new_persons_to_photograph)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         violations_str = "_".join(
             str(p["label"]).replace(" ", "_").replace("+", "").replace("&", "")
             for p in new_persons_to_photograph
         )
-        violations_str = "".join(
-            c if c.isalnum() or c in "_-" else "_" for c in violations_str
-        )[:80]
-        screenshot_path = os.path.join(
-            self.screenshots_dir,
-            f"violation_{zoom_mode}_{violations_str}_{timestamp}.jpg",
-        )
+        # Keep filename short / filesystem-safe
+        violations_str = "".join(c if c.isalnum() or c in "_-" else "_" for c in violations_str)[:80]
+        screenshot_path = os.path.join(self.screenshots_dir, f"violation_{violations_str}_{timestamp}.jpg")
         cv2.imwrite(
             screenshot_path,
             screenshot_frame,
@@ -244,22 +177,22 @@ class ScreenshotManager:
             )
             upload_result = self.cloudinary_uploader.upload(
                 screenshot_path,
-                tags=["safety-violation", "ppe-detection", zoom_mode],
+                tags=["safety-violation", "ppe-detection", "zoomed"],
                 context=context,
             )
             if upload_result:
                 image_url = upload_result["url"]
                 print(f"Cloudinary upload complete: {image_url}")
 
+        # Mark these persons as photographed with current timestamp
         current_time = datetime.now()
         for person_info in new_persons_to_photograph:
             person_with_timestamp = person_info.copy()
-            person_with_timestamp["timestamp"] = current_time
+            person_with_timestamp['timestamp'] = current_time
             self.photographed_persons.append(person_with_timestamp)
 
         return {
             "path": screenshot_path,
             "image_url": image_url,
             "persons": new_persons_to_photograph,
-            "zoom_mode": zoom_mode,
         }
