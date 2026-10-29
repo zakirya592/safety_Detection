@@ -791,13 +791,12 @@ def draw_person_box(annotated, box, status, confidence, track_id=None):
     return width, height
 
 
-def process_frame(frame, camera_name, frame_count, person_tracker, camera_config=None):
+def process_frame(frame, camera_name, frame_count, person_tracker):
     """
     Person-first pipeline:
       1. Detect people with the PPE model (the only model that has Person).
       2. If nobody is found, skip PPE and keep waiting.
       3. If a person is found, run helmet/vest/gloves/goggles on that person only.
-      4. On violation: crop from THIS same frame (boxes stay aligned).
     """
     annotated = frame
 
@@ -863,12 +862,8 @@ def process_frame(frame, camera_name, frame_count, person_tracker, camera_config
         alarm.play()
         print(f"Violations detected: {[p['label'] for p in violating_persons]}")
         print(f"Violating persons count: {len(violating_persons)}")
-        # Crop the same frame used for detection so boxes stay correct.
-        # (Protect snapshot FOV/timing differs from RTSP and was cropping empty areas.)
         screenshot_result = screenshot_manager.take_screenshot(
-            frame,
-            violating_persons,
-            camera_name=camera_name,
+            frame, violating_persons, camera_name=camera_name
         )
         if screenshot_result:
             print(f"Screenshot saved: {screenshot_result['path']}")
@@ -956,8 +951,7 @@ def camera_worker(config):
                 frame,
                 camera_name,
                 frame_counter,
-                tracker,
-                camera_config=config,
+                tracker
             )
         else:
             processed = frame
